@@ -1,0 +1,56 @@
+[project]
+name = "responder-thinker"
+version = "0.1.0"
+description = "Multi-thinker Responder-Thinker pattern for real-time voice AI"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Nick" },
+]
+keywords = ["voice-ai", "realtime", "agents", "webrtc", "openai"]
+
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "websockets>=13.0",
+
+    # WebRTC server-side
+    "aiortc>=1.9.0",
+
+    # OpenAI
+    "openai>=1.60.0",
+    "openai-agents>=0.1.0",
+
+    # State management
+    "redis[hiredis]>=5.0.0",
+
+    # Observability
+    "langsmith>=0.2.0",
+
+    # Utils
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.0.0",
+    "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+    "mypy>=1.11.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
