@@ -137,16 +137,29 @@ async function connect() {
             }
         };
 
-        // Create and send offer to backend
+        // Create offer and wait for ICE gathering to complete so the SDP
+        // sent to the backend contains all candidates (aiortc needs them).
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
+
+        await new Promise((resolve) => {
+            if (peerConnection.iceGatheringState === 'complete') {
+                resolve();
+            } else {
+                peerConnection.addEventListener('icegatheringstatechange', () => {
+                    if (peerConnection.iceGatheringState === 'complete') {
+                        resolve();
+                    }
+                });
+            }
+        });
 
         addEvent('rtc', 'Sending SDP offer to backend');
 
         const response = await fetch('/api/rtc/offer', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sdp: offer.sdp }),
+            body: JSON.stringify({ sdp: peerConnection.localDescription.sdp }),
         });
 
         if (!response.ok) {

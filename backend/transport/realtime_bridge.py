@@ -126,7 +126,6 @@ class RealtimeBridge:
 
         headers = {
             "Authorization": f"Bearer {settings.openai_api_key}",
-            "OpenAI-Beta": "realtime=v1",
         }
         url = f"{REALTIME_API_URL}?model={settings.realtime_model}"
 
@@ -152,19 +151,32 @@ class RealtimeBridge:
         config = {
             "type": "session.update",
             "session": {
-                "modalities": ["text", "audio"],
+                "type": "realtime",
+                "output_modalities": ["audio"],
                 "instructions": RESPONDER_INSTRUCTIONS,
-                "voice": settings.realtime_voice,
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "input_audio_transcription": {
-                    "model": "whisper-1",
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
+                "audio": {
+                    "input": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": 24000,
+                        },
+                        "transcription": {
+                            "model": "whisper-1",
+                        },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500,
+                        },
+                    },
+                    "output": {
+                        "format": {
+                            "type": "audio/pcm",
+                            "rate": 24000,
+                        },
+                        "voice": settings.realtime_voice,
+                    },
                 },
                 "tools": [ROUTE_TO_THINKER_TOOL],
             },
@@ -198,7 +210,7 @@ class RealtimeBridge:
                 # Convert aiortc AudioFrame → 24kHz mono PCM16 base64
                 # Handles sample rate conversion (48kHz → 24kHz) and channel mixing
                 audio_b64 = aiortc_frame_to_realtime_b64(frame)
-
+                # log.info("bridge.audio_frame_received", session_id=self.session_id, timestamp=frame.time, audio=audio_b64[:50] + "...")
                 await self._realtime_ws.send(
                     json.dumps(
                         {
@@ -224,10 +236,9 @@ class RealtimeBridge:
             async for message in self._realtime_ws:
                 event = json.loads(message)
                 event_type = event.get("type", "")
-
                 match event_type:
                     # --- Audio output: send back to browser ---
-                    case "response.audio.delta":
+                    case "response.output_audio.delta":
                         await self._handle_audio_output(event)
 
                     # --- Tool calls: intercept for Thinker routing ---
@@ -239,7 +250,7 @@ class RealtimeBridge:
                     case "conversation.item.input_audio_transcription.completed":
                         await self._handle_transcription(event, role="user")
 
-                    case "response.audio_transcript.done":
+                    case "response.output_audio_transcript.done":
                         await self._handle_transcription(event, role="assistant")
 
                     # --- Session lifecycle ---
