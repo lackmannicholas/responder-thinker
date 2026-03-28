@@ -24,6 +24,8 @@ def setup_tracing() -> None:
     # Import here to avoid circular import at module load time
     from backend.config import settings
 
+    log.info(f"tracing.setup", enabled=settings.langsmith_tracing_enabled, project=settings.langsmith_project, api_key_set=bool(settings.langsmith_api_key))
+
     if not settings.langsmith_tracing_enabled or not settings.langsmith_api_key:
         log.info("tracing.disabled")
         return

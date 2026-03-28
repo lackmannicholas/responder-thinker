@@ -9,11 +9,12 @@ import json
 
 from openai import AsyncOpenAI
 from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 
-client = AsyncOpenAI(api_key=settings.openai_api_key)
+client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key))
 
 NEWS_TOOLS = [
     {
@@ -111,28 +112,19 @@ class NewsThinker(BaseThinker):
                     "title": f"Breaking: Major development in {topic} sector",
                     "source": "Reuters",
                     "published": "2 hours ago",
-                    "summary": (
-                        f"Experts are closely watching developments in {topic} "
-                        "as new information emerges."
-                    ),
+                    "summary": (f"Experts are closely watching developments in {topic} " "as new information emerges."),
                 },
                 {
                     "title": f"Analysis: What recent {topic} trends mean for the future",
                     "source": "AP News",
                     "published": "4 hours ago",
-                    "summary": (
-                        f"Analysts weigh in on the implications of the latest "
-                        f"{topic} developments."
-                    ),
+                    "summary": (f"Analysts weigh in on the implications of the latest " f"{topic} developments."),
                 },
                 {
                     "title": f"{topic.capitalize()} update: Key stakeholders respond",
                     "source": "BBC",
                     "published": "6 hours ago",
-                    "summary": (
-                        f"Reactions continue to pour in following the latest "
-                        f"news on {topic}."
-                    ),
+                    "summary": (f"Reactions continue to pour in following the latest " f"news on {topic}."),
                 },
             ][:count],
         }

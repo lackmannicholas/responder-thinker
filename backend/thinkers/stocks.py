@@ -8,11 +8,12 @@ import json
 
 from openai import AsyncOpenAI
 from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 
-client = AsyncOpenAI(api_key=settings.openai_api_key)
+client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key))
 
 STOCKS_TOOLS = [
     {
@@ -98,12 +99,12 @@ class StocksThinker(BaseThinker):
         """
         symbol = args.get("symbol", "UNKNOWN").upper()
         mock_prices = {
-            "AAPL":  {"price": 189.50, "change": 1.25,  "change_pct": 0.66,  "volume": 52_000_000},
-            "TSLA":  {"price": 248.73, "change": -3.42, "change_pct": -1.36, "volume": 98_000_000},
-            "SPY":   {"price": 522.15, "change": 2.10,  "change_pct": 0.40,  "volume": 75_000_000},
-            "MSFT":  {"price": 415.32, "change": 0.87,  "change_pct": 0.21,  "volume": 21_000_000},
+            "AAPL": {"price": 189.50, "change": 1.25, "change_pct": 0.66, "volume": 52_000_000},
+            "TSLA": {"price": 248.73, "change": -3.42, "change_pct": -1.36, "volume": 98_000_000},
+            "SPY": {"price": 522.15, "change": 2.10, "change_pct": 0.40, "volume": 75_000_000},
+            "MSFT": {"price": 415.32, "change": 0.87, "change_pct": 0.21, "volume": 21_000_000},
             "GOOGL": {"price": 176.44, "change": -0.55, "change_pct": -0.31, "volume": 18_000_000},
-            "NVDA":  {"price": 875.40, "change": 12.30, "change_pct": 1.43,  "volume": 44_000_000},
+            "NVDA": {"price": 875.40, "change": 12.30, "change_pct": 1.43, "volume": 44_000_000},
         }
         data = mock_prices.get(
             symbol,

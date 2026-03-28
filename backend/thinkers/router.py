@@ -14,6 +14,7 @@ In production, you might add:
 
 import structlog
 from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from backend.thinkers.base import BaseThinker
 from backend.thinkers.weather import WeatherThinker
@@ -57,6 +58,11 @@ class ThinkerRouter:
         Returns the Thinker's response as a string, ready for the
         Responder to deliver via voice.
         """
+        run_tree = get_current_run_tree()
+        if run_tree:
+            run_tree.session_id = session_id
+            run_tree.metadata["session_id"] = session_id
+
         thinker = self._thinkers.get(domain)
 
         if thinker is None:

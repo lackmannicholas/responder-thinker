@@ -21,6 +21,8 @@ import time
 
 import structlog
 import websockets
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 from backend.config import settings
 from backend.audio_convert import aiortc_frame_to_realtime_b64, realtime_b64_to_aiortc_frame
@@ -321,15 +323,7 @@ class RealtimeBridge:
         """
         Intercept tool calls from the Responder.
 
-        If the tool is `route_to_thinker`, we:
-          1. Parse the domain and query
-          2. Route to the appropriate Thinker agent
-          3. Return the Thinker's response to the Realtime API
-          4. Trigger the Responder to deliver the answer
-
-        This is the heart of the Responder-Thinker pattern.
-        This runs as a concurrent task — the Responder keeps talking while
-        the Thinker works in the background.
+        Parses the event, then delegates to the traced method with clean inputs.
         """
         call_id = event.get("call_id", "")
         name = event.get("name", "")
@@ -347,31 +341,7 @@ class RealtimeBridge:
             log.error("bridge.tool_parse_error", arguments=arguments)
             return
 
-        log.info(
-            "bridge.thinker_routed",
-            session_id=self.session_id,
-            domain=domain,
-            query=query[:100],
-        )
-
-        # Get conversation context from Redis for the Thinker
-        context = await self.session_store.get_conversation_context(self.session_id)
-
-        start_time = time.monotonic()
-        result = await self.thinker_router.think(
-            domain=domain,
-            query=query,
-            context=context,
-            session_id=self.session_id,
-        )
-        elapsed_ms = (time.monotonic() - start_time) * 1000
-
-        log.info(
-            "bridge.thinker_complete",
-            session_id=self.session_id,
-            domain=domain,
-            elapsed_ms=round(elapsed_ms, 1),
-        )
+        result = await self._execute_thinker(domain=domain, query=query, call_id=call_id)
 
         # Return the Thinker result to the Realtime API as a tool response
         await self._realtime_ws.send(
@@ -390,22 +360,76 @@ class RealtimeBridge:
         # Trigger the Responder to generate a response based on the Thinker output
         await self._realtime_ws.send(json.dumps({"type": "response.create"}))
 
+    @traceable(name="responder.thinker_call")
+    async def _execute_thinker(self, domain: str, query: str, call_id: str) -> str:
+        """Route to a Thinker and return the result. Traced with clean I/O."""
+        run_tree = get_current_run_tree()
+        if run_tree:
+            run_tree.session_id = self.session_id
+            run_tree.metadata["session_id"] = self.session_id
+
+        log.info(
+            "bridge.thinker_routed",
+            session_id=self.session_id,
+            domain=domain,
+            query=query[:100],
+        )
+
+        context = await self.session_store.get_conversation_context(self.session_id)
+
+        start_time = time.monotonic()
+        result = await self.thinker_router.think(
+            domain=domain,
+            query=query,
+            context=context,
+            session_id=self.session_id,
+        )
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        log.info(
+            "bridge.thinker_complete",
+            session_id=self.session_id,
+            domain=domain,
+            elapsed_ms=round(elapsed_ms, 1),
+        )
+
+        return result
+
     async def _handle_transcription(self, event: dict, role: str):
-        """Store transcriptions in Redis for Thinker conversation context."""
+        """Extract transcript and pass to traced storage."""
         transcript = event.get("transcript", "")
         if transcript:
-            await self.session_store.append_turn(
-                session_id=self.session_id,
-                role=role,
-                content=transcript,
-            )
+            await self._store_transcription(role=role, transcript=transcript)
 
-            log.info(
-                "bridge.transcription",
-                session_id=self.session_id,
-                role=role,
-                transcript=transcript,
-            )
+    @traceable(name="responder.transcription")
+    async def _store_transcription(self, role: str, transcript: str) -> dict:
+        """Store transcription in Redis. Traced with conversation context."""
+        run_tree = get_current_run_tree()
+        if run_tree:
+            run_tree.session_id = self.session_id
+            run_tree.metadata["session_id"] = self.session_id
+
+        # Fetch conversation context so the trace shows what the user/assistant said in context
+        context = await self.session_store.get_conversation_context(self.session_id)
+
+        await self.session_store.append_turn(
+            session_id=self.session_id,
+            role=role,
+            content=transcript,
+        )
+
+        log.info(
+            "bridge.transcription",
+            session_id=self.session_id,
+            role=role,
+            transcript=transcript,
+        )
+
+        return {
+            "role": role,
+            "transcript": transcript,
+            "conversation_context": context,
+        }
 
     async def cleanup(self):
         """Clean up resources."""
