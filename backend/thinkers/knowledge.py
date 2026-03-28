@@ -12,7 +12,7 @@ from langsmith import traceable
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 
-client = AsyncOpenAI(api_key=settings.openai_api_key)
+client = AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1")
 
 KNOWLEDGE_SYSTEM_PROMPT = """\
 You are a knowledgeable general assistant. Answer the user's question clearly \
@@ -44,7 +44,4 @@ class KnowledgeThinker(BaseThinker):
             messages=messages,
         )
 
-        return (
-            response.choices[0].message.content
-            or "I don't have information on that right now."
-        )
+        return response.choices[0].message.content or "I don't have information on that right now."

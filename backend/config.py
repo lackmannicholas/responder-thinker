@@ -15,7 +15,10 @@ class Settings(BaseSettings):
     # Use a versioned model name — the undated alias is sometimes rejected.
     # Valid options: gpt-4o-realtime-preview-2024-12-17, gpt-4o-mini-realtime-preview-2024-12-17
     realtime_model: str = "gpt-realtime"
-    realtime_voice: str = "alloy"
+    realtime_voice: str = "shimmer"
+
+    # transcript model
+    transcript_model: str = "gpt-4o-mini-transcribe"
 
     # Thinker models
     thinker_model: str = "gpt-4.1-mini"  # Weather, Stocks (fast)

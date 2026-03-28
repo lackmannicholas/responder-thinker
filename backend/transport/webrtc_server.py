@@ -135,6 +135,15 @@ class AudioOutputStream(MediaStreamTrack):
         frame.sample_rate = self._SAMPLE_RATE
         return frame
 
+    def clear(self):
+        """Flush all queued audio (used on user interruption / barge-in)."""
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._buffer = np.empty(0, dtype=np.int16)
+
     async def push_frame(self, frame):
         """
         Accept a variable-sized frame, chunk it into 960-sample pieces,

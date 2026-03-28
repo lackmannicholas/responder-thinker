@@ -73,6 +73,11 @@ You are a friendly, conversational voice assistant. You are the Responder — \
 your job is to keep the conversation flowing naturally while specialized \
 backend agents (Thinkers) handle complex questions.
 
+## Language:
+- Speak the language of the user — if they ask in Spanish, respond in Spanish.
+- Default to speaking English if you can't detect the language.
+- Keep your responses concise and conversational — this is a voice interaction, not text.
+
 ## Your role:
 - Greet users warmly and maintain natural conversation
 - When the user asks something that needs real data (weather, stocks, news, \
@@ -119,6 +124,7 @@ class RealtimeBridge:
         self.websocket = websocket
         self._realtime_ws = None
         self._running = False
+        self._response_active = False  # True while the API is generating a response
 
     async def run(self):
         """Main loop: connect to Realtime API and start bidirectional streaming."""
@@ -160,15 +166,11 @@ class RealtimeBridge:
                             "type": "audio/pcm",
                             "rate": 24000,
                         },
+                        "noise_reduction": {"type": "far_field"},
                         "transcription": {
-                            "model": "whisper-1",
+                            "model": "gpt-4o-mini-transcribe",
                         },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "threshold": 0.5,
-                            "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500,
-                        },
+                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
                     },
                     "output": {
                         "format": {
@@ -210,7 +212,6 @@ class RealtimeBridge:
                 # Convert aiortc AudioFrame → 24kHz mono PCM16 base64
                 # Handles sample rate conversion (48kHz → 24kHz) and channel mixing
                 audio_b64 = aiortc_frame_to_realtime_b64(frame)
-                # log.info("bridge.audio_frame_received", session_id=self.session_id, timestamp=frame.time, audio=audio_b64[:50] + "...")
                 await self._realtime_ws.send(
                     json.dumps(
                         {
@@ -237,6 +238,13 @@ class RealtimeBridge:
                 event = json.loads(message)
                 event_type = event.get("type", "")
                 match event_type:
+                    # --- Response lifecycle ---
+                    case "response.created":
+                        self._response_active = True
+
+                    case "response.done":
+                        self._response_active = False
+
                     # --- Audio output: send back to browser ---
                     case "response.output_audio.delta":
                         await self._handle_audio_output(event)
@@ -245,6 +253,10 @@ class RealtimeBridge:
                     case "response.function_call_arguments.done":
                         # Run thinker concurrently so the Responder keeps talking
                         asyncio.create_task(self._handle_tool_call(event))
+
+                    # --- User interruption (barge-in) ---
+                    case "input_audio_buffer.speech_started":
+                        await self._handle_interrupt()
 
                     # --- Transcription: store for context ---
                     case "conversation.item.input_audio_transcription.completed":
@@ -265,7 +277,8 @@ class RealtimeBridge:
                         )
 
                     case _:
-                        log.debug("bridge.event", type=event_type)
+                        pass
+                        # log.debug("bridge.event", type=event_type)
 
         except websockets.exceptions.ConnectionClosed:
             log.info("bridge.realtime_disconnected", session_id=self.session_id)
@@ -284,6 +297,25 @@ class RealtimeBridge:
         # Convert 24kHz PCM16 base64 → 48kHz aiortc AudioFrame
         frame = realtime_b64_to_aiortc_frame(audio_b64)
         await self.audio_track.output_track.push_frame(frame)
+
+    async def _handle_interrupt(self):
+        """
+        Handle user barge-in: the user started speaking while the model
+        was still outputting audio.
+
+        1. Tell the Realtime API to stop generating the current response.
+        2. Flush any queued audio so the user doesn't hear stale output.
+        """
+        log.info("bridge.user_interrupt", session_id=self.session_id)
+
+        # Cancel the in-flight response so the API stops sending audio deltas
+        if self._response_active:
+            await self._realtime_ws.send(json.dumps({"type": "response.cancel"}))
+            self._response_active = False
+
+        # Flush queued audio frames so the browser stops hearing old output
+        if self.audio_track:
+            self.audio_track.output_track.clear()
 
     async def _handle_tool_call(self, event: dict):
         """
@@ -366,6 +398,13 @@ class RealtimeBridge:
                 session_id=self.session_id,
                 role=role,
                 content=transcript,
+            )
+
+            log.info(
+                "bridge.transcription",
+                session_id=self.session_id,
+                role=role,
+                transcript=transcript,
             )
 
     async def cleanup(self):
