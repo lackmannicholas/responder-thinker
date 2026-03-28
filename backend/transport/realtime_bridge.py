@@ -21,8 +21,7 @@ import time
 
 import structlog
 import websockets
-from langsmith import traceable
-from langsmith.run_helpers import get_current_run_tree
+from langsmith.run_helpers import trace
 
 from backend.config import settings
 from backend.audio_convert import aiortc_frame_to_realtime_b64, realtime_b64_to_aiortc_frame
@@ -76,6 +75,7 @@ your job is to keep the conversation flowing naturally while specialized \
 backend agents (Thinkers) handle complex questions.
 
 ## Language:
+- The User will always speak English.
 - Speak the language of the user — if they ask in Spanish, respond in Spanish.
 - Default to speaking English if you can't detect the language.
 - Keep your responses concise and conversational — this is a voice interaction, not text.
@@ -128,31 +128,86 @@ class RealtimeBridge:
         self._running = False
         self._response_active = False  # True while the API is generating a response
 
+        # Tracing state: session (root) → turn → thinker
+        self._session_ctx = None  # trace() for the whole session
+        self._session_run = None  # RunTree for the session (root run)
+        self._turn_ctx = None  # trace() for the current conversation turn
+        self._turn_run = None  # RunTree for the current turn
+
+    # ── Tracing lifecycle ───────────────────────────────────────────────
+    # One session = one LangSmith run. Each turn and thinker call nests inside.
+
+    async def _start_session_trace(self) -> None:
+        """Open the root session trace. Called once when the bridge starts."""
+        self._session_ctx = trace(
+            "voice_session",
+            run_type="chain",
+            inputs={"session_id": self.session_id},
+            metadata={"session_id": self.session_id},
+        )
+        self._session_run = await self._session_ctx.__aenter__()
+        self._session_run.session_id = self.session_id
+
+    async def _end_session_trace(self) -> None:
+        """Close the root session trace. Called on cleanup."""
+        await self._end_turn("[session ended]")
+        if self._session_run:
+            self._session_run.end(outputs={"session_id": self.session_id, "status": "completed"})
+        if self._session_ctx:
+            await self._session_ctx.__aexit__(None, None, None)
+        self._session_ctx = None
+        self._session_run = None
+
+    async def _start_turn(self, user_message: str, conversation_context: list[dict]) -> None:
+        """Open a conversation turn trace, nested under the session."""
+        await self._end_turn("[superseded]")
+        self._turn_ctx = trace(
+            "conversation_turn",
+            run_type="chain",
+            inputs={"user_message": user_message, "conversation_context": conversation_context},
+            metadata={"session_id": self.session_id},
+            parent=self._session_run,
+        )
+        self._turn_run = await self._turn_ctx.__aenter__()
+
+    async def _end_turn(self, response: str) -> None:
+        """Close the current turn trace with the assistant's response."""
+        if self._turn_run:
+            self._turn_run.end(outputs={"assistant_response": response})
+        if self._turn_ctx:
+            await self._turn_ctx.__aexit__(None, None, None)
+        self._turn_ctx = None
+        self._turn_run = None
+
     async def run(self):
         """Main loop: connect to Realtime API and start bidirectional streaming."""
         self._running = True
+        await self._start_session_trace()
 
-        headers = {
-            "Authorization": f"Bearer {settings.openai_api_key}",
-        }
-        url = f"{REALTIME_API_URL}?model={settings.realtime_model}"
+        try:
+            headers = {
+                "Authorization": f"Bearer {settings.openai_api_key}",
+            }
+            url = f"{REALTIME_API_URL}?model={settings.realtime_model}"
 
-        log.info("bridge.connecting", session_id=self.session_id, url=url)
+            log.info("bridge.connecting", session_id=self.session_id, url=url)
 
-        async with websockets.connect(url, additional_headers=headers) as ws:
-            self._realtime_ws = ws
+            async with websockets.connect(url, additional_headers=headers) as ws:
+                self._realtime_ws = ws
 
-            # Configure the session
-            await self._configure_session()
+                # Configure the session
+                await self._configure_session()
 
-            # Run two concurrent loops:
-            #   1. Read audio from browser → send to OpenAI
-            #   2. Read events from OpenAI → handle them
-            await asyncio.gather(
-                self._audio_input_loop(),
-                self._event_handler_loop(),
-                return_exceptions=True,
-            )
+                # Run two concurrent loops:
+                #   1. Read audio from browser → send to OpenAI
+                #   2. Read events from OpenAI → handle them
+                await asyncio.gather(
+                    self._audio_input_loop(),
+                    self._event_handler_loop(),
+                    return_exceptions=True,
+                )
+        finally:
+            await self._end_session_trace()
 
     async def _configure_session(self):
         """Send initial session configuration to the Realtime API."""
@@ -168,11 +223,11 @@ class RealtimeBridge:
                             "type": "audio/pcm",
                             "rate": 24000,
                         },
-                        "noise_reduction": {"type": "far_field"},
+                        # "noise_reduction": {"type": "far_field"},
                         "transcription": {
                             "model": "gpt-4o-mini-transcribe",
                         },
-                        "turn_detection": {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
+                        "turn_detection": {"type": "semantic_vad"},  # {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
                     },
                     "output": {
                         "format": {
@@ -224,6 +279,12 @@ class RealtimeBridge:
                 )
         except Exception as e:
             log.error("bridge.audio_input_error", error=str(e), session_id=self.session_id)
+        finally:
+            # Browser disconnected — close the Realtime API WebSocket so
+            # the event handler loop exits and run() can reach its finally block.
+            self._running = False
+            if self._realtime_ws:
+                await self._realtime_ws.close()
 
     async def _event_handler_loop(self):
         """
@@ -258,14 +319,15 @@ class RealtimeBridge:
 
                     # --- User interruption (barge-in) ---
                     case "input_audio_buffer.speech_started":
+                        await self._end_turn("[interrupted by user]")
                         await self._handle_interrupt()
 
-                    # --- Transcription: store for context ---
+                    # --- Transcription: turn lifecycle ---
                     case "conversation.item.input_audio_transcription.completed":
-                        await self._handle_transcription(event, role="user")
+                        await self._handle_user_transcription(event)
 
                     case "response.output_audio_transcript.done":
-                        await self._handle_transcription(event, role="assistant")
+                        await self._handle_assistant_transcription(event)
 
                     # --- Session lifecycle ---
                     case "session.created":
@@ -319,11 +381,56 @@ class RealtimeBridge:
         if self.audio_track:
             self.audio_track.output_track.clear()
 
+    async def _handle_user_transcription(self, event: dict):
+        """User finished speaking — start a new conversation turn trace."""
+        transcript = event.get("transcript", "")
+        if not transcript:
+            return
+
+        context = await self.session_store.get_conversation_context(self.session_id)
+
+        await self.session_store.append_turn(
+            session_id=self.session_id,
+            role="user",
+            content=transcript,
+        )
+
+        await self._start_turn(user_message=transcript, conversation_context=context)
+
+        log.info(
+            "bridge.transcription",
+            session_id=self.session_id,
+            role="user",
+            transcript=transcript,
+        )
+
+    async def _handle_assistant_transcription(self, event: dict):
+        """Assistant finished speaking — close the conversation turn trace."""
+        transcript = event.get("transcript", "")
+        if not transcript:
+            return
+
+        await self.session_store.append_turn(
+            session_id=self.session_id,
+            role="assistant",
+            content=transcript,
+        )
+
+        await self._end_turn(transcript)
+
+        log.info(
+            "bridge.transcription",
+            session_id=self.session_id,
+            role="assistant",
+            transcript=transcript,
+        )
+
     async def _handle_tool_call(self, event: dict):
         """
         Intercept tool calls from the Responder.
 
-        Parses the event, then delegates to the traced method with clean inputs.
+        Parses the event, runs the Thinker as a child span of the current
+        conversation turn, and returns the result to the Realtime API.
         """
         call_id = event.get("call_id", "")
         name = event.get("name", "")
@@ -341,7 +448,41 @@ class RealtimeBridge:
             log.error("bridge.tool_parse_error", arguments=arguments)
             return
 
-        result = await self._execute_thinker(domain=domain, query=query, call_id=call_id)
+        log.info(
+            "bridge.thinker_routed",
+            session_id=self.session_id,
+            domain=domain,
+            query=query[:100],
+        )
+
+        context = await self.session_store.get_conversation_context(self.session_id)
+
+        start_time = time.monotonic()
+
+        # Nest the thinker trace explicitly under the current conversation turn
+        parent = self._turn_run or self._session_run
+        async with trace(
+            "thinker_call",
+            run_type="tool",
+            inputs={"domain": domain, "query": query},
+            metadata={"session_id": self.session_id, "domain": domain},
+            parent=parent,
+        ) as thinker_span:
+            result = await self.thinker_router.think(
+                domain=domain,
+                query=query,
+                context=context,
+                session_id=self.session_id,
+            )
+            thinker_span.end(outputs={"result": result[:200] if result else ""})
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        log.info(
+            "bridge.thinker_complete",
+            session_id=self.session_id,
+            domain=domain,
+            elapsed_ms=round(elapsed_ms, 1),
+        )
 
         # Return the Thinker result to the Realtime API as a tool response
         await self._realtime_ws.send(
@@ -359,77 +500,6 @@ class RealtimeBridge:
 
         # Trigger the Responder to generate a response based on the Thinker output
         await self._realtime_ws.send(json.dumps({"type": "response.create"}))
-
-    @traceable(name="responder.thinker_call")
-    async def _execute_thinker(self, domain: str, query: str, call_id: str) -> str:
-        """Route to a Thinker and return the result. Traced with clean I/O."""
-        run_tree = get_current_run_tree()
-        if run_tree:
-            run_tree.session_id = self.session_id
-            run_tree.metadata["session_id"] = self.session_id
-
-        log.info(
-            "bridge.thinker_routed",
-            session_id=self.session_id,
-            domain=domain,
-            query=query[:100],
-        )
-
-        context = await self.session_store.get_conversation_context(self.session_id)
-
-        start_time = time.monotonic()
-        result = await self.thinker_router.think(
-            domain=domain,
-            query=query,
-            context=context,
-            session_id=self.session_id,
-        )
-        elapsed_ms = (time.monotonic() - start_time) * 1000
-
-        log.info(
-            "bridge.thinker_complete",
-            session_id=self.session_id,
-            domain=domain,
-            elapsed_ms=round(elapsed_ms, 1),
-        )
-
-        return result
-
-    async def _handle_transcription(self, event: dict, role: str):
-        """Extract transcript and pass to traced storage."""
-        transcript = event.get("transcript", "")
-        if transcript:
-            await self._store_transcription(role=role, transcript=transcript)
-
-    @traceable(name="responder.transcription")
-    async def _store_transcription(self, role: str, transcript: str) -> dict:
-        """Store transcription in Redis. Traced with conversation context."""
-        run_tree = get_current_run_tree()
-        if run_tree:
-            run_tree.session_id = self.session_id
-            run_tree.metadata["session_id"] = self.session_id
-
-        # Fetch conversation context so the trace shows what the user/assistant said in context
-        context = await self.session_store.get_conversation_context(self.session_id)
-
-        await self.session_store.append_turn(
-            session_id=self.session_id,
-            role=role,
-            content=transcript,
-        )
-
-        log.info(
-            "bridge.transcription",
-            session_id=self.session_id,
-            role=role,
-            transcript=transcript,
-        )
-
-        return {
-            "role": role,
-            "transcript": transcript,
-            "conversation_context": context,
-        }
 
     async def cleanup(self):
         """Clean up resources."""

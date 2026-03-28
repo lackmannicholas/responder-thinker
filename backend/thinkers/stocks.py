@@ -13,7 +13,7 @@ from langsmith.wrappers import wrap_openai
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 
-client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key))
+client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1"))
 
 STOCKS_TOOLS = [
     {

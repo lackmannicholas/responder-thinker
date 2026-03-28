@@ -80,6 +80,7 @@ async def rtc_offer(request: dict):
         thinker_router=thinker_router,
         session_store=session_store,
     )
+    # bridge.run() has try/finally that closes the session trace
     asyncio.create_task(bridge.run())
 
     return {"sdp": answer_sdp, "session_id": session_id}
