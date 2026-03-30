@@ -35,8 +35,8 @@ app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
 
 # Initialize shared components (one instance per process)
 webrtc_server = WebRTCServer()
-thinker_router = ThinkerRouter()
 session_store = SessionStore(settings.redis_url)
+thinker_router = ThinkerRouter(session_store=session_store)
 
 # Active bridge instances keyed by session_id (for SSE access)
 _bridges: dict[str, RealtimeBridge] = {}

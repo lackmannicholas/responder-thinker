@@ -21,6 +21,7 @@ from backend.thinkers.weather import WeatherThinker
 from backend.thinkers.stocks import StocksThinker
 from backend.thinkers.news import NewsThinker
 from backend.thinkers.knowledge import KnowledgeThinker
+from backend.state.session_store import SessionStore
 
 log = structlog.get_logger()
 
@@ -28,8 +29,9 @@ log = structlog.get_logger()
 class ThinkerRouter:
     """Routes queries to specialized Thinker agents by domain."""
 
-    def __init__(self):
+    def __init__(self, session_store: SessionStore):
         self._thinkers: dict[str, BaseThinker] = {}
+        self._session_store = session_store
         self._register_thinkers()
 
     def _register_thinkers(self):
@@ -63,6 +65,12 @@ class ThinkerRouter:
             run_tree.session_id = session_id
             run_tree.metadata["session_id"] = session_id
 
+        # Check global cache before calling the thinker
+        cached = await self._session_store.get_cached_result(domain=domain, query=query)
+        if cached is not None:
+            log.info("router.cache_hit", domain=domain, session_id=session_id)
+            return cached
+
         thinker = self._thinkers.get(domain)
 
         if thinker is None:
@@ -87,6 +95,14 @@ class ThinkerRouter:
                 domain=domain,
                 result_length=len(result),
             )
+
+            # Cache the result for future identical queries
+            await self._session_store.cache_thinker_result(
+                domain=domain,
+                query=query,
+                result=result,
+            )
+
             return result
         except Exception as e:
             log.error(

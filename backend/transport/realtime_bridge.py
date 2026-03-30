@@ -136,6 +136,7 @@ class RealtimeBridge:
         self._session_run = None  # RunTree for the session (root run)
         self._turn_ctx = None  # trace() for the current conversation turn
         self._turn_run = None  # RunTree for the current turn
+        self._pending_turn_response = None  # saved so _end_turn uses real text
 
     # ── Tracing lifecycle ───────────────────────────────────────────────
     # One session = one LangSmith run. Each turn and thinker call nests inside.
@@ -176,7 +177,9 @@ class RealtimeBridge:
     async def _end_turn(self, response: str) -> None:
         """Close the current turn trace with the assistant's response."""
         if self._turn_run:
-            self._turn_run.end(outputs={"assistant_response": response})
+            output = self._pending_turn_response or response
+            self._turn_run.end(outputs={"assistant_response": output})
+            self._pending_turn_response = None
         if self._turn_ctx:
             await self._turn_ctx.__aexit__(None, None, None)
         self._turn_ctx = None
@@ -428,7 +431,9 @@ class RealtimeBridge:
             content=transcript,
         )
 
-        await self._end_turn(transcript)
+        # Don't end the turn here — a thinker task may still be running.
+        # The turn closes when the next turn starts or the session ends.
+        self._pending_turn_response = transcript
 
         self.event_queue.put_nowait({"type": "transcript_done", "role": "assistant", "content": transcript})
 

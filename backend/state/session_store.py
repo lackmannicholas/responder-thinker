@@ -23,15 +23,15 @@ log = structlog.get_logger()
 
 # Key patterns
 CONVERSATION_KEY = "session:{session_id}:conversation"
-CACHE_KEY = "session:{session_id}:cache:{domain}:{query_hash}"
+CACHE_KEY = "cache:{domain}:{query_hash}"
 METADATA_KEY = "session:{session_id}:meta"
 
 # TTLs
-SESSION_TTL = 3600          # 1 hour
-CACHE_TTL_WEATHER = 600     # 10 minutes
-CACHE_TTL_STOCKS = 60       # 1 minute
-CACHE_TTL_NEWS = 300        # 5 minutes
-CACHE_TTL_DEFAULT = 120     # 2 minutes
+SESSION_TTL = 3600  # 1 hour
+CACHE_TTL_WEATHER = 600  # 10 minutes
+CACHE_TTL_STOCKS = 60  # 1 minute
+CACHE_TTL_NEWS = 300  # 5 minutes
+CACHE_TTL_DEFAULT = 120  # 2 minutes
 
 
 class SessionStore:
@@ -57,9 +57,7 @@ class SessionStore:
         await self._redis.rpush(key, turn)
         await self._redis.expire(key, SESSION_TTL)
 
-    async def get_conversation_context(
-        self, session_id: str, max_turns: int = 10
-    ) -> list[dict]:
+    async def get_conversation_context(self, session_id: str, max_turns: int = 10) -> list[dict]:
         """Get recent conversation history for Thinker context."""
         key = CONVERSATION_KEY.format(session_id=session_id)
         turns = await self._redis.lrange(key, -max_turns, -1)
@@ -67,15 +65,13 @@ class SessionStore:
 
     async def cache_thinker_result(
         self,
-        session_id: str,
         domain: str,
         query: str,
         result: str,
     ):
-        """Cache a Thinker result to avoid redundant calls."""
+        """Cache a Thinker result to avoid redundant calls. Shared across all sessions."""
         query_hash = str(hash(query))[:12]
         key = CACHE_KEY.format(
-            session_id=session_id,
             domain=domain,
             query_hash=query_hash,
         )
@@ -86,13 +82,10 @@ class SessionStore:
         }.get(domain, CACHE_TTL_DEFAULT)
         await self._redis.setex(key, ttl, result)
 
-    async def get_cached_result(
-        self, session_id: str, domain: str, query: str
-    ) -> str | None:
-        """Check for a cached Thinker result."""
+    async def get_cached_result(self, domain: str, query: str) -> str | None:
+        """Check for a cached Thinker result. Shared across all sessions."""
         query_hash = str(hash(query))[:12]
         key = CACHE_KEY.format(
-            session_id=session_id,
             domain=domain,
             query_hash=query_hash,
         )
