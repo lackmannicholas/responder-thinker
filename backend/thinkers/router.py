@@ -21,6 +21,7 @@ from backend.thinkers.weather import WeatherThinker
 from backend.thinkers.stocks import StocksThinker
 from backend.thinkers.news import NewsThinker
 from backend.thinkers.knowledge import KnowledgeThinker
+from backend.thinkers.research import ResearchThinker
 from backend.state.session_store import SessionStore
 
 log = structlog.get_logger()
@@ -41,6 +42,7 @@ class ThinkerRouter:
             StocksThinker(),
             NewsThinker(),
             KnowledgeThinker(),
+            ResearchThinker(),
         ]
         for thinker in thinkers:
             self._thinkers[thinker.domain] = thinker

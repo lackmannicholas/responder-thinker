@@ -50,13 +50,14 @@ ROUTE_TO_THINKER_TOOL = {
         "properties": {
             "domain": {
                 "type": "string",
-                "enum": ["weather", "stocks", "news", "knowledge"],
+                "enum": ["weather", "stocks", "news", "knowledge", "research"],
                 "description": (
                     "Which specialist to route to: "
                     "'weather' for current conditions and forecasts, "
                     "'stocks' for stock prices and market data, "
                     "'news' for recent headlines and current events, "
-                    "'knowledge' for general questions and facts."
+                    "'knowledge' for general questions and facts, "
+                    "'research' for deep research or complex analysis that may take a while."
                 ),
             },
             "query": {
@@ -93,6 +94,7 @@ backend agents (Thinkers) handle complex questions.
 - Weather questions → domain: "weather"
 - Stock prices, market data → domain: "stocks"
 - News, current events, headlines → domain: "news"
+- Deep research, complex analysis, "research this" → domain: "research"
 - General knowledge, facts, explanations → domain: "knowledge"
 
 ## Important:
