@@ -134,6 +134,10 @@ class RealtimeBridge:
         self._response_done: asyncio.Event = asyncio.Event()
         self._response_done.set()  # No active response at start
 
+        # Idle detection: nudge at 15s, disconnect at 60s
+        self._last_user_activity: float = time.monotonic()
+        self._nudge_sent: bool = False
+
         # Event queue for pushing transcripts/events to the frontend via SSE
         self.event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -210,12 +214,14 @@ class RealtimeBridge:
                 # Configure the session
                 await self._configure_session()
 
-                # Run two concurrent loops:
+                # Run three concurrent loops:
                 #   1. Read audio from browser → send to OpenAI
                 #   2. Read events from OpenAI → handle them
+                #   3. Monitor for idle user → nudge / disconnect
                 await asyncio.gather(
                     self._audio_input_loop(),
                     self._event_handler_loop(),
+                    self._idle_monitor_loop(),
                     return_exceptions=True,
                 )
         finally:
@@ -334,12 +340,14 @@ class RealtimeBridge:
 
                     # --- User interruption (barge-in) ---
                     case "input_audio_buffer.speech_started":
+                        self._reset_idle_timer()
                         self.event_queue.put_nowait({"type": "transcript_interrupted"})
                         await self._end_turn("[interrupted by user]")
                         await self._handle_interrupt()
 
                     # --- Transcription: turn lifecycle ---
                     case "conversation.item.input_audio_transcription.completed":
+                        self._reset_idle_timer()
                         await self._handle_user_transcription(event)
 
                     case "response.output_audio_transcript.delta":
@@ -367,6 +375,87 @@ class RealtimeBridge:
 
         except websockets.exceptions.ConnectionClosed:
             log.info("bridge.realtime_disconnected", session_id=self.session_id)
+
+    def _reset_idle_timer(self) -> None:
+        """Reset the idle timer when the user shows activity."""
+        self._last_user_activity = time.monotonic()
+        self._nudge_sent = False
+
+    async def _idle_monitor_loop(self):
+        """
+        Monitor for user inactivity.
+
+        - After 15s of silence: ask the Responder to nudge the user.
+        - After 60s of silence: disconnect the session.
+        """
+        NUDGE_AFTER = 15  # seconds
+        DISCONNECT_AFTER = 60  # seconds
+
+        try:
+            while self._running:
+                await asyncio.sleep(1)
+                idle = time.monotonic() - self._last_user_activity
+
+                if idle >= DISCONNECT_AFTER:
+                    log.info(
+                        "bridge.idle_disconnect",
+                        session_id=self.session_id,
+                        idle_seconds=round(idle, 1),
+                    )
+                    # Say goodbye before closing the connection
+                    if self._realtime_ws and not self._response_active:
+                        try:
+                            await self._realtime_ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "response.create",
+                                        "response": {
+                                            "instructions": (
+                                                "The user has been inactive for a while and the session "
+                                                "is ending. Say a brief, warm goodbye — something like "
+                                                '"It was nice chatting! Feel free to reconnect whenever '
+                                                "you'd like to talk again.\" Keep it to one sentence."
+                                            ),
+                                        },
+                                    }
+                                )
+                            )
+                            # Give the Responder a moment to generate the sign-off audio
+                            await asyncio.sleep(5)
+                        except websockets.exceptions.ConnectionClosed:
+                            pass
+                    self.event_queue.put_nowait({"type": "session_idle_disconnect"})
+                    self._running = False
+                    if self._realtime_ws:
+                        await self._realtime_ws.close()
+                    return
+
+                if idle >= NUDGE_AFTER and not self._nudge_sent and not self._response_active:
+                    self._nudge_sent = True
+                    log.info(
+                        "bridge.idle_nudge",
+                        session_id=self.session_id,
+                        idle_seconds=round(idle, 1),
+                    )
+                    self.event_queue.put_nowait({"type": "session_idle_nudge"})
+                    # Ask the Responder to gently check in with the user
+                    await self._realtime_ws.send(
+                        json.dumps(
+                            {
+                                "type": "response.create",
+                                "response": {
+                                    "instructions": (
+                                        "The user has been quiet for a moment. "
+                                        "Gently check in — ask if they're still there "
+                                        "or if there's anything else you can help with. "
+                                        "Keep it brief and warm."
+                                    ),
+                                },
+                            }
+                        )
+                    )
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
+            pass
 
     async def _handle_audio_output(self, event: dict):
         """

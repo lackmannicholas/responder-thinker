@@ -287,6 +287,17 @@ function connectEventStream(sid) {
             case 'session_ended':
                 addTranscript('system', 'Session ended.');
                 addEvent('session', 'Session ended');
+                cleanup();
+                break;
+
+            case 'session_idle_nudge':
+                addEvent('idle', 'Nudging user (15s idle)');
+                break;
+
+            case 'session_idle_disconnect':
+                addTranscript('system', 'Disconnected due to inactivity.');
+                addEvent('idle', 'Disconnected (60s idle)');
+                cleanup();
                 break;
         }
     };

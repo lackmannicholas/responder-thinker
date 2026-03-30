@@ -90,6 +90,7 @@ async def rtc_offer(request: dict):
             await bridge.run()
         finally:
             _bridges.pop(session_id, None)
+            await webrtc_server.close_session(session_id)
 
     asyncio.create_task(_run_and_cleanup())
 
