@@ -11,6 +11,7 @@ tool calls to route them to specialized Thinker agents.
 import asyncio
 import json
 import uuid
+from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request
@@ -28,11 +29,6 @@ from backend.observability.tracing import setup_tracing
 
 log = structlog.get_logger()
 
-app = FastAPI(title="Responder-Thinker", version="0.1.0")
-
-# Serve the frontend static assets (JS, CSS, etc.)
-app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
-
 # Initialize shared components (one instance per process)
 webrtc_server = WebRTCServer()
 session_store = SessionStore(settings.redis_url)
@@ -42,16 +38,19 @@ thinker_router = ThinkerRouter(session_store=session_store)
 _bridges: dict[str, RealtimeBridge] = {}
 
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     setup_tracing()
     await session_store.connect()
     log.info("responder_thinker.started", model=settings.realtime_model)
-
-
-@app.on_event("shutdown")
-async def shutdown():
+    yield
     await session_store.disconnect()
+
+
+app = FastAPI(title="Responder-Thinker", version="0.1.0", lifespan=lifespan)
+
+# Serve the frontend static assets (JS, CSS, etc.)
+app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
 
 
 @app.get("/")

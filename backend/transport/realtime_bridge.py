@@ -128,6 +128,12 @@ class RealtimeBridge:
         self._running = False
         self._response_active = False  # True while the API is generating a response
 
+        # Coordination: monotonic turn counter to detect stale thinker results
+        self._turn_id: int = 0
+        # Event that is *set* when no response is in progress, *cleared* while one is
+        self._response_done: asyncio.Event = asyncio.Event()
+        self._response_done.set()  # No active response at start
+
         # Event queue for pushing transcripts/events to the frontend via SSE
         self.event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -311,9 +317,11 @@ class RealtimeBridge:
                     # --- Response lifecycle ---
                     case "response.created":
                         self._response_active = True
+                        self._response_done.clear()
 
                     case "response.done":
                         self._response_active = False
+                        self._response_done.set()
 
                     # --- Audio output: send back to browser ---
                     case "response.output_audio.delta":
@@ -385,10 +393,14 @@ class RealtimeBridge:
         """
         log.info("bridge.user_interrupt", session_id=self.session_id)
 
+        # Invalidate any in-flight thinker tasks so they won't trigger response.create
+        self._turn_id += 1
+
         # Cancel the in-flight response so the API stops sending audio deltas
         if self._response_active:
             await self._realtime_ws.send(json.dumps({"type": "response.cancel"}))
             self._response_active = False
+            self._response_done.set()  # Unblock anything waiting on the old response
 
         # Flush queued audio frames so the browser stops hearing old output
         if self.audio_track:
@@ -467,6 +479,9 @@ class RealtimeBridge:
             log.error("bridge.tool_parse_error", arguments=arguments)
             return
 
+        # Snapshot the turn so we can detect staleness after the thinker returns
+        dispatched_turn_id = self._turn_id
+
         log.info(
             "bridge.thinker_routed",
             session_id=self.session_id,
@@ -507,7 +522,8 @@ class RealtimeBridge:
 
         self.event_queue.put_nowait({"type": "thinker", "event": "complete", "domain": domain, "elapsed_ms": round(elapsed_ms, 1)})
 
-        # Return the Thinker result to the Realtime API as a tool response
+        # Always submit the tool output — the Realtime API expects a response
+        # for every tool call regardless of whether the turn is still active.
         await self._realtime_ws.send(
             json.dumps(
                 {
@@ -520,6 +536,45 @@ class RealtimeBridge:
                 }
             )
         )
+
+        # ── Guard 1: skip response.create if the user interrupted ──
+        # If the turn changed (user barge-in), the result is stale.
+        # We still submitted the tool output above (API requires it),
+        # but we don't ask the Responder to speak a stale answer.
+        if self._turn_id != dispatched_turn_id:
+            log.info(
+                "bridge.thinker_stale",
+                session_id=self.session_id,
+                domain=domain,
+                dispatched_turn=dispatched_turn_id,
+                current_turn=self._turn_id,
+            )
+            return
+
+        # ── Guard 2: wait for any in-flight response to finish ──
+        # The Realtime API silently drops response.create while it is
+        # already generating a response (e.g. the "let me check" filler).
+        # This is the primary cause of the "thinker came back but the
+        # Responder didn't say anything" bug.
+        try:
+            await asyncio.wait_for(self._response_done.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            log.warning(
+                "bridge.response_wait_timeout",
+                session_id=self.session_id,
+                domain=domain,
+            )
+
+        # ── Guard 3: re-check staleness after waiting ──
+        # The user could have interrupted while we were waiting for the
+        # active response to finish.
+        if self._turn_id != dispatched_turn_id:
+            log.info(
+                "bridge.thinker_stale_after_wait",
+                session_id=self.session_id,
+                domain=domain,
+            )
+            return
 
         # Trigger the Responder to generate a response based on the Thinker output
         await self._realtime_ws.send(json.dumps({"type": "response.create"}))
