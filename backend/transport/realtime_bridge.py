@@ -323,12 +323,18 @@ class RealtimeBridge:
 
                     # --- User interruption (barge-in) ---
                     case "input_audio_buffer.speech_started":
+                        self.event_queue.put_nowait({"type": "transcript_interrupted"})
                         await self._end_turn("[interrupted by user]")
                         await self._handle_interrupt()
 
                     # --- Transcription: turn lifecycle ---
                     case "conversation.item.input_audio_transcription.completed":
                         await self._handle_user_transcription(event)
+
+                    case "response.output_audio_transcript.delta":
+                        delta = event.get("delta", "")
+                        if delta:
+                            self.event_queue.put_nowait({"type": "transcript_delta", "delta": delta})
 
                     case "response.output_audio_transcript.done":
                         await self._handle_assistant_transcription(event)
@@ -424,7 +430,7 @@ class RealtimeBridge:
 
         await self._end_turn(transcript)
 
-        self.event_queue.put_nowait({"type": "transcript", "role": "assistant", "content": transcript})
+        self.event_queue.put_nowait({"type": "transcript_done", "role": "assistant", "content": transcript})
 
         log.info(
             "bridge.transcription",

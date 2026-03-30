@@ -18,6 +18,7 @@ let peerConnection = null;
 let localStream = null;
 let sessionId = null;
 let eventSource = null;
+let streamingTurn = null; // Current assistant bubble being streamed into
 
 // --- UI Helpers ---
 
@@ -202,6 +203,8 @@ function cleanup() {
         eventSource = null;
     }
 
+    streamingTurn = null;
+
     if (peerConnection) {
         peerConnection.close();
         peerConnection = null;
@@ -228,8 +231,49 @@ function connectEventStream(sid) {
 
         switch (data.type) {
             case 'transcript':
-                addTranscript(data.role, data.content);
+                if (data.role === 'user' && streamingTurn) {
+                    // User transcription arrived after assistant started streaming —
+                    // insert it before the in-progress assistant bubble to keep order correct.
+                    const container = document.getElementById('transcript');
+                    const turn = document.createElement('div');
+                    turn.className = 'turn user';
+                    const text = document.createElement('span');
+                    text.textContent = data.content;
+                    turn.appendChild(text);
+                    container.insertBefore(turn, streamingTurn);
+                    container.scrollTop = container.scrollHeight;
+                } else {
+                    addTranscript(data.role, data.content);
+                }
                 addEvent('transcript', `${data.role}: ${data.content.slice(0, 60)}...`);
+                break;
+
+            case 'transcript_interrupted':
+                streamingTurn = null;
+                break;
+
+            case 'transcript_delta': {
+                const container = document.getElementById('transcript');
+                if (!streamingTurn) {
+                    streamingTurn = document.createElement('div');
+                    streamingTurn.className = 'turn assistant';
+                    const text = document.createElement('span');
+                    streamingTurn.appendChild(text);
+                    container.appendChild(streamingTurn);
+                }
+                const span = streamingTurn.querySelector('span');
+                span.textContent += data.delta;
+                container.scrollTop = container.scrollHeight;
+                break;
+            }
+
+            case 'transcript_done':
+                if (streamingTurn) {
+                    const span = streamingTurn.querySelector('span');
+                    span.textContent = data.content;
+                }
+                streamingTurn = null;
+                addEvent('transcript', `assistant: ${data.content.slice(0, 60)}...`);
                 break;
 
             case 'thinker':
