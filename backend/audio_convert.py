@@ -8,9 +8,8 @@ aiortc delivers audio as av.AudioFrame objects:
 OpenAI Realtime API expects/produces:
   - 24000 Hz, mono (1 channel), PCM16 (signed 16-bit little-endian)
 
-This module handles the conversion in both directions.
-Getting this right is critical — wrong sample rates = chipmunk audio,
-wrong channel count = silence or noise, wrong frame sizes = choppy playback.
+This module handles the conversion in both directions using av.AudioResampler
+(backed by libswresample) for proper anti-aliased resampling.
 """
 
 import base64
@@ -30,46 +29,32 @@ AIORTC_SAMPLE_RATE = 48000
 AIORTC_CHANNELS = 1  # We request mono from the browser
 AIORTC_FRAME_SAMPLES = 960  # 20ms at 48kHz
 
+# Resamplers (stateful — they handle filter state across calls for gapless audio)
+_downsampler = av.AudioResampler(format="s16", layout="mono", rate=OPENAI_SAMPLE_RATE)
+_upsampler = av.AudioResampler(format="s16", layout="mono", rate=AIORTC_SAMPLE_RATE)
+
 
 def aiortc_frame_to_realtime_b64(frame: av.AudioFrame) -> str:
     """
     Convert an aiortc AudioFrame to base64-encoded PCM16 for the Realtime API.
 
-    Steps:
-      1. Extract raw samples from the frame as numpy array
-      2. Convert to mono if stereo
-      3. Resample from 48kHz to 24kHz (simple 2:1 decimation)
-      4. Ensure 16-bit signed integer format
-      5. Base64 encode
+    Uses av.AudioResampler (libswresample) for proper anti-aliased downsampling
+    from 48kHz to 24kHz, avoiding the aliasing artifacts that naive decimation
+    produces (which degrade transcription accuracy).
     """
-    # Get raw audio data as numpy array
-    # frame.to_ndarray() returns shape (channels, samples) for planar formats
-    # or (samples,) for packed formats
-    audio = frame.to_ndarray()
+    # Resample to 24kHz mono s16 in one step
+    resampled_frames = _downsampler.resample(frame)
 
-    # Handle different frame layouts
-    if audio.ndim == 2:
-        # Planar: (channels, samples) — average to mono
-        audio = audio.mean(axis=0)
+    if not resampled_frames:
+        return ""
 
-    # Ensure float for processing
-    audio = audio.astype(np.float64)
+    # Concatenate all output frames (resampler may buffer)
+    chunks = []
+    for rf in resampled_frames:
+        audio = rf.to_ndarray().flatten().astype(np.int16)
+        chunks.append(audio)
 
-    # Resample 48kHz → 24kHz (simple decimation — take every other sample)
-    # This works cleanly because 48000/24000 = 2
-    if frame.sample_rate == AIORTC_SAMPLE_RATE:
-        audio = audio[::2]
-    elif frame.sample_rate != OPENAI_SAMPLE_RATE:
-        # Generic resampling for non-standard rates
-        ratio = OPENAI_SAMPLE_RATE / frame.sample_rate
-        indices = np.arange(0, len(audio), 1 / ratio).astype(int)
-        indices = indices[indices < len(audio)]
-        audio = audio[indices]
-
-    # Clip and convert to int16
-    audio = np.clip(audio, -32768, 32767).astype(np.int16)
-
-    # Base64 encode the raw bytes
+    audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
     return base64.b64encode(audio.tobytes()).decode("utf-8")
 
 
@@ -77,11 +62,7 @@ def realtime_b64_to_aiortc_frame(audio_b64: str) -> av.AudioFrame:
     """
     Convert base64-encoded PCM16 from the Realtime API to an aiortc AudioFrame.
 
-    Steps:
-      1. Base64 decode to raw PCM16 bytes
-      2. Parse as numpy int16 array
-      3. Upsample from 24kHz to 48kHz (simple 2x interpolation)
-      4. Build an av.AudioFrame
+    Uses av.AudioResampler for proper upsampling from 24kHz to 48kHz.
     """
     # Decode base64 to raw bytes
     raw_bytes = base64.b64decode(audio_b64)
@@ -89,19 +70,30 @@ def realtime_b64_to_aiortc_frame(audio_b64: str) -> av.AudioFrame:
     # Parse as int16 samples
     audio = np.frombuffer(raw_bytes, dtype=np.int16)
 
-    # Upsample 24kHz → 48kHz (repeat each sample — simple but effective)
-    audio_48k = np.repeat(audio, 2)
-
-    # Build an av.AudioFrame
-    frame = av.AudioFrame.from_ndarray(
-        audio_48k.reshape(1, -1),  # Shape: (channels, samples)
+    # Build a 24kHz frame first
+    frame_24k = av.AudioFrame.from_ndarray(
+        audio.reshape(1, -1),
         format="s16",
         layout="mono",
     )
-    frame.sample_rate = AIORTC_SAMPLE_RATE
-    frame.time_base = Fraction(1, AIORTC_SAMPLE_RATE)
+    frame_24k.sample_rate = OPENAI_SAMPLE_RATE
+    frame_24k.time_base = Fraction(1, OPENAI_SAMPLE_RATE)
 
-    return frame
+    # Resample to 48kHz
+    resampled_frames = _upsampler.resample(frame_24k)
+
+    if not resampled_frames:
+        # Return a silence frame if resampler is buffering
+        silence = np.zeros(AIORTC_FRAME_SAMPLES, dtype=np.int16)
+        frame = av.AudioFrame.from_ndarray(silence.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = AIORTC_SAMPLE_RATE
+        frame.time_base = Fraction(1, AIORTC_SAMPLE_RATE)
+        return frame
+
+    # Use the first resampled frame (typically only one for small chunks)
+    result = resampled_frames[0]
+    result.time_base = Fraction(1, AIORTC_SAMPLE_RATE)
+    return result
 
 
 def pcm16_bytes_to_b64(pcm_bytes: bytes) -> str:

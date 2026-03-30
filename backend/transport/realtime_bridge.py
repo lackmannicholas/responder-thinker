@@ -128,6 +128,9 @@ class RealtimeBridge:
         self._running = False
         self._response_active = False  # True while the API is generating a response
 
+        # Event queue for pushing transcripts/events to the frontend via SSE
+        self.event_queue: asyncio.Queue = asyncio.Queue()
+
         # Tracing state: session (root) → turn → thinker
         self._session_ctx = None  # trace() for the whole session
         self._session_run = None  # RunTree for the session (root run)
@@ -208,6 +211,7 @@ class RealtimeBridge:
                 )
         finally:
             await self._end_session_trace()
+            self.event_queue.put_nowait(None)  # Signal SSE stream to close
 
     async def _configure_session(self):
         """Send initial session configuration to the Realtime API."""
@@ -397,6 +401,8 @@ class RealtimeBridge:
 
         await self._start_turn(user_message=transcript, conversation_context=context)
 
+        self.event_queue.put_nowait({"type": "transcript", "role": "user", "content": transcript})
+
         log.info(
             "bridge.transcription",
             session_id=self.session_id,
@@ -417,6 +423,8 @@ class RealtimeBridge:
         )
 
         await self._end_turn(transcript)
+
+        self.event_queue.put_nowait({"type": "transcript", "role": "assistant", "content": transcript})
 
         log.info(
             "bridge.transcription",
@@ -455,6 +463,8 @@ class RealtimeBridge:
             query=query[:100],
         )
 
+        self.event_queue.put_nowait({"type": "thinker", "event": "routed", "domain": domain, "query": query})
+
         context = await self.session_store.get_conversation_context(self.session_id)
 
         start_time = time.monotonic()
@@ -484,6 +494,8 @@ class RealtimeBridge:
             elapsed_ms=round(elapsed_ms, 1),
         )
 
+        self.event_queue.put_nowait({"type": "thinker", "event": "complete", "domain": domain, "elapsed_ms": round(elapsed_ms, 1)})
+
         # Return the Thinker result to the Realtime API as a tool response
         await self._realtime_ws.send(
             json.dumps(
@@ -504,6 +516,7 @@ class RealtimeBridge:
     async def cleanup(self):
         """Clean up resources."""
         self._running = False
+        self.event_queue.put_nowait(None)  # Signal SSE to close
         if self._realtime_ws:
             await self._realtime_ws.close()
         log.info("bridge.cleaned_up", session_id=self.session_id)

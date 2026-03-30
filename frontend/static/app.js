@@ -17,6 +17,7 @@
 let peerConnection = null;
 let localStream = null;
 let sessionId = null;
+let eventSource = null;
 
 // --- UI Helpers ---
 
@@ -177,6 +178,9 @@ async function connect() {
 
         addEvent('rtc', 'SDP answer set, waiting for ICE...');
 
+        // Connect to SSE for transcripts and thinker events
+        connectEventStream(session_id);
+
     } catch (error) {
         console.error('Connection failed:', error);
         setStatus('error', 'Connection failed');
@@ -193,6 +197,11 @@ function disconnect() {
 }
 
 function cleanup() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+
     if (peerConnection) {
         peerConnection.close();
         peerConnection = null;
@@ -209,33 +218,36 @@ function cleanup() {
     document.getElementById('disconnectBtn').disabled = true;
 }
 
-// --- Data Channel (for Thinker events) ---
-// TODO: Add a data channel alongside the audio tracks so the backend
-// can push structured events (thinker routing, transcripts, timing)
-// to the frontend in real-time. This enables the event log to show
-// which Thinker is processing and how long it takes.
-//
-// peerConnection.ondatachannel = (event) => {
-//     const channel = event.channel;
-//     channel.onmessage = (msg) => {
-//         const data = JSON.parse(msg.data);
-//         handleBackendEvent(data);
-//     };
-// };
-//
-// function handleBackendEvent(event) {
-//     switch (event.type) {
-//         case 'thinker.routed':
-//             addEvent('thinker', `→ ${event.domain}: "${event.query}"`, 'thinker');
-//             break;
-//         case 'thinker.complete':
-//             addEvent('thinker', `← ${event.domain} (${event.elapsed_ms}ms)`, 'thinker');
-//             break;
-//         case 'transcript.user':
-//             addTranscript('user', event.text);
-//             break;
-//         case 'transcript.assistant':
-//             addTranscript('assistant', event.text, event.domain);
-//             break;
-//     }
-// }
+// --- Server-Sent Events (transcripts & thinker events) ---
+
+function connectEventStream(sid) {
+    eventSource = new EventSource(`/api/events/${sid}`);
+
+    eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        switch (data.type) {
+            case 'transcript':
+                addTranscript(data.role, data.content);
+                addEvent('transcript', `${data.role}: ${data.content.slice(0, 60)}...`);
+                break;
+
+            case 'thinker':
+                if (data.event === 'routed') {
+                    addEvent('thinker', `→ ${data.domain}: "${data.query.slice(0, 50)}"`, 'thinker');
+                } else if (data.event === 'complete') {
+                    addEvent('thinker', `← ${data.domain} (${data.elapsed_ms}ms)`, 'thinker');
+                }
+                break;
+
+            case 'session_ended':
+                addTranscript('system', 'Session ended.');
+                addEvent('session', 'Session ended');
+                break;
+        }
+    };
+
+    eventSource.onerror = () => {
+        addEvent('sse', 'Event stream disconnected', 'error');
+    };
+}
