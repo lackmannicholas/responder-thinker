@@ -146,9 +146,10 @@ class RealtimeBridge:
         self._response_create_lock: asyncio.Lock = asyncio.Lock()
 
         # Idle detection: nudge at 15s, disconnect at 60s
-        # Tracks the last meaningful activity — user speech OR the last
-        # audio chunk actually sent to the browser via the WebRTC pacer.
+        # _last_activity: reset on user speech AND audio drain (for nudge timer)
+        # _last_user_speech: reset ONLY on user speech (for disconnect timer)
         self._last_activity: float = time.monotonic()
+        self._last_user_speech: float = time.monotonic()
         self._nudge_sent: bool = False
         self._audio_drained: asyncio.Event = asyncio.Event()
 
@@ -406,8 +407,10 @@ class RealtimeBridge:
             log.info("bridge.realtime_disconnected", session_id=self.session_id)
 
     def _reset_idle_timer(self) -> None:
-        """Reset the idle timer on any meaningful activity (user or agent)."""
-        self._last_activity = time.monotonic()
+        """Reset idle timers when the user speaks."""
+        now = time.monotonic()
+        self._last_activity = now
+        self._last_user_speech = now
         self._nudge_sent = False
 
     async def _audio_drain_monitor_loop(self):
@@ -424,7 +427,9 @@ class RealtimeBridge:
             while self._running:
                 await self._audio_drained.wait()
                 self._audio_drained.clear()
-                self._reset_idle_timer()
+                # Only reset the nudge timer, NOT _nudge_sent or the disconnect timer.
+                # The user hasn't spoken — the agent just finished talking.
+                self._last_activity = time.monotonic()
                 self.event_queue.put_nowait({"type": "audio_playback_finished"})
                 log.info("bridge.audio_playback_finished", session_id=self.session_id)
         except asyncio.CancelledError:
@@ -450,12 +455,13 @@ class RealtimeBridge:
                     continue
 
                 idle = time.monotonic() - self._last_activity
+                idle_since_user = time.monotonic() - self._last_user_speech
 
-                if idle >= DISCONNECT_AFTER:
+                if idle_since_user >= DISCONNECT_AFTER:
                     log.info(
                         "bridge.idle_disconnect",
                         session_id=self.session_id,
-                        idle_seconds=round(idle, 1),
+                        idle_seconds=round(idle_since_user, 1),
                     )
                     # Say goodbye before closing the connection
                     if self._realtime_ws:
@@ -514,7 +520,9 @@ class RealtimeBridge:
                                             "The user has been quiet for a moment. "
                                             "Gently check in — ask if they're still there "
                                             "or if there's anything else you can help with. "
-                                            "Keep it brief and warm."
+                                            "Do NOT repeat or summarize anything from a tool call. "
+                                            "Keep it brief and warm — just a short check-in. "
+                                            "Example: \"Hi? Are you still there? Is there anything else I can help with?\""
                                         ),
                                     },
                                 }
