@@ -442,7 +442,7 @@ class RealtimeBridge:
         - After 15s of silence: ask the Responder to nudge the user.
         - After 60s of silence: disconnect the session.
         """
-        NUDGE_AFTER = 15  # seconds
+        NUDGE_AFTER = 10  # seconds
         DISCONNECT_AFTER = 60  # seconds
 
         try:
@@ -521,8 +521,10 @@ class RealtimeBridge:
                                             "Gently check in — ask if they're still there "
                                             "or if there's anything else you can help with. "
                                             "Do NOT repeat or summarize anything from a tool call. "
+                                            "If a tool is running, it's best to acknowledge that and say you'll get back to them when you have the information. "
                                             "Keep it brief and warm — just a short check-in. "
-                                            "Example: \"Hi? Are you still there? Is there anything else I can help with?\""
+                                            "Example No Tool Running: \"Hi? Are you still there? Is there anything else I can help with?\" "
+                                            "Example Tool Running: \"Is there anything else I can help with while I gather that information?\" "
                                         ),
                                     },
                                 }
