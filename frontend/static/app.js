@@ -294,6 +294,10 @@ function connectEventStream(sid) {
                 addEvent('idle', 'Nudging user (15s idle)');
                 break;
 
+            case 'audio_playback_finished':
+                addEvent('idle', 'Audio finished — idle timer started');
+                break;
+
             case 'session_idle_disconnect':
                 addTranscript('system', 'Disconnected due to inactivity.');
                 addEvent('idle', 'Disconnected (60s idle)');

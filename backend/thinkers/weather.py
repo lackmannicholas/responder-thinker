@@ -8,14 +8,12 @@ independent of the Responder and other Thinkers.
 
 import json
 
-from openai import AsyncOpenAI
 from langsmith import traceable
-from langsmith.wrappers import wrap_openai
 
-from backend.config import settings
+from backend.config import settings, make_openai_client
 from backend.thinkers.base import BaseThinker
 
-client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1"))
+client = make_openai_client()
 
 # Thinker-specific tools
 WEATHER_TOOLS = [

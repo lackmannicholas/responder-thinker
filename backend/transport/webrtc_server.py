@@ -125,6 +125,8 @@ class AudioOutputStream(MediaStreamTrack):
         self._buffer = np.empty(0, dtype=np.int16)  # leftover samples
         self._start: float | None = None  # monotonic clock anchor
         self._frame_count = 0  # number of frames emitted (for clock calc)
+        self._was_playing = False  # True while we're draining real audio
+        self.on_audio_drained: asyncio.Event | None = None  # set when queue drains
 
     # Pre-allocate a reusable silence array
     _SILENCE = np.zeros(_SAMPLES_PER_FRAME, dtype=np.int16)
@@ -143,6 +145,7 @@ class AudioOutputStream(MediaStreamTrack):
             except asyncio.QueueEmpty:
                 break
         self._buffer = np.empty(0, dtype=np.int16)
+        self._was_playing = False  # Don't trigger a false drain event
 
     async def push_frame(self, frame):
         """
@@ -176,11 +179,13 @@ class AudioOutputStream(MediaStreamTrack):
         now = loop.time()
         delay = target - now
 
+        is_real = False
         if delay > 0:
             # Sleep until our next tick, but grab a frame from the queue
             # while we wait so we're ready the instant the tick fires.
             try:
                 frame = await asyncio.wait_for(self._queue.get(), timeout=delay)
+                is_real = True
                 # We got a frame early — still wait for the tick
                 remaining = target - loop.time()
                 if remaining > 0:
@@ -193,8 +198,17 @@ class AudioOutputStream(MediaStreamTrack):
             # (no sleep) to catch up.
             try:
                 frame = self._queue.get_nowait()
+                is_real = True
             except asyncio.QueueEmpty:
                 frame = self._make_frame(self._SILENCE)
+
+        # Detect transition from real audio → silence (queue drained)
+        if self._was_playing and not is_real:
+            self._was_playing = False
+            if self.on_audio_drained is not None:
+                self.on_audio_drained.set()
+        elif is_real:
+            self._was_playing = True
 
         self._frame_count += 1
 

@@ -19,12 +19,13 @@ import asyncio
 import json
 import time
 
+import av
 import structlog
 import websockets
 from langsmith.run_helpers import trace
 
 from backend.config import settings
-from backend.audio_convert import aiortc_frame_to_realtime_b64, realtime_b64_to_aiortc_frame
+from backend.audio_convert import AudioConverter
 from backend.thinkers.router import ThinkerRouter
 from backend.state.session_store import SessionStore
 
@@ -76,9 +77,8 @@ your job is to keep the conversation flowing naturally while specialized \
 backend agents (Thinkers) handle complex questions.
 
 ## Language:
-- The User will always speak English.
-- Speak the language of the user — if they ask in Spanish, respond in Spanish.
-- Default to speaking English if you can't detect the language.
+- Default to English.
+- If the user speaks another language, match their language.
 - Keep your responses concise and conversational — this is a voice interaction, not text.
 
 ## Your role:
@@ -130,15 +130,27 @@ class RealtimeBridge:
         self._running = False
         self._response_active = False  # True while the API is generating a response
 
+        # Per-session audio converter — resamplers are stateful and must not
+        # be shared across concurrent sessions.
+        self._audio_converter = AudioConverter()
+
         # Coordination: monotonic turn counter to detect stale thinker results
         self._turn_id: int = 0
         # Event that is *set* when no response is in progress, *cleared* while one is
         self._response_done: asyncio.Event = asyncio.Event()
         self._response_done.set()  # No active response at start
 
+        # Lock that serializes response.create calls. The Realtime API silently
+        # drops overlapping response.create requests, so only one caller at a
+        # time (thinker result, idle nudge, idle disconnect) may send one.
+        self._response_create_lock: asyncio.Lock = asyncio.Lock()
+
         # Idle detection: nudge at 15s, disconnect at 60s
-        self._last_user_activity: float = time.monotonic()
+        # Tracks the last meaningful activity — user speech OR the last
+        # audio chunk actually sent to the browser via the WebRTC pacer.
+        self._last_activity: float = time.monotonic()
         self._nudge_sent: bool = False
+        self._audio_drained: asyncio.Event = asyncio.Event()
 
         # Event queue for pushing transcripts/events to the frontend via SSE
         self.event_queue: asyncio.Queue = asyncio.Queue()
@@ -216,14 +228,20 @@ class RealtimeBridge:
                 # Configure the session
                 await self._configure_session()
 
-                # Run three concurrent loops:
+                # Wire the output track's drain event to our idle timer
+                if self.audio_track:
+                    self.audio_track.output_track.on_audio_drained = self._audio_drained
+
+                # Run concurrent loops:
                 #   1. Read audio from browser → send to OpenAI
                 #   2. Read events from OpenAI → handle them
                 #   3. Monitor for idle user → nudge / disconnect
+                #   4. Reset idle timer when audio finishes playing
                 await asyncio.gather(
                     self._audio_input_loop(),
                     self._event_handler_loop(),
                     self._idle_monitor_loop(),
+                    self._audio_drain_monitor_loop(),
                     return_exceptions=True,
                 )
         finally:
@@ -285,19 +303,28 @@ class RealtimeBridge:
 
         try:
             while self._running:
-                frame = await input_track.recv()
+                try:
+                    frame = await input_track.recv()
 
-                # Convert aiortc AudioFrame → 24kHz mono PCM16 base64
-                # Handles sample rate conversion (48kHz → 24kHz) and channel mixing
-                audio_b64 = aiortc_frame_to_realtime_b64(frame)
-                await self._realtime_ws.send(
-                    json.dumps(
-                        {
-                            "type": "input_audio_buffer.append",
-                            "audio": audio_b64,
-                        }
+                    # Convert aiortc AudioFrame → 24kHz mono PCM16 base64
+                    audio_b64 = self._audio_converter.aiortc_frame_to_realtime_b64(frame)
+
+                    # Skip empty frames (resampler may buffer on first call)
+                    if not audio_b64:
+                        continue
+
+                    await self._realtime_ws.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": audio_b64,
+                            }
+                        )
                     )
-                )
+                except (av.error.InvalidDataError, ValueError, IndexError, TypeError) as e:
+                    # Transient audio frame errors — log and continue, don't kill the session
+                    log.warning("bridge.audio_frame_error", error=str(e), session_id=self.session_id)
+                    continue
         except Exception as e:
             log.error("bridge.audio_input_error", error=str(e), session_id=self.session_id)
         finally:
@@ -379,9 +406,29 @@ class RealtimeBridge:
             log.info("bridge.realtime_disconnected", session_id=self.session_id)
 
     def _reset_idle_timer(self) -> None:
-        """Reset the idle timer when the user shows activity."""
-        self._last_user_activity = time.monotonic()
+        """Reset the idle timer on any meaningful activity (user or agent)."""
+        self._last_activity = time.monotonic()
         self._nudge_sent = False
+
+    async def _audio_drain_monitor_loop(self):
+        """
+        Wait for the WebRTC pacer to finish playing queued audio, then
+        reset the idle timer.
+
+        OpenAI sends audio deltas much faster than real-time. The actual
+        playback pace is controlled by AudioOutputStream.recv(). This loop
+        watches for the transition from real audio → silence, which is when
+        the user is truly "idle."
+        """
+        try:
+            while self._running:
+                await self._audio_drained.wait()
+                self._audio_drained.clear()
+                self._reset_idle_timer()
+                self.event_queue.put_nowait({"type": "audio_playback_finished"})
+                log.info("bridge.audio_playback_finished", session_id=self.session_id)
+        except asyncio.CancelledError:
+            pass
 
     async def _idle_monitor_loop(self):
         """
@@ -396,7 +443,13 @@ class RealtimeBridge:
         try:
             while self._running:
                 await asyncio.sleep(1)
-                idle = time.monotonic() - self._last_user_activity
+
+                # Don't count time while the agent is still speaking —
+                # audio is queued and the WebRTC pacer is actively sending frames.
+                if self.audio_track and self.audio_track.output_track._was_playing:
+                    continue
+
+                idle = time.monotonic() - self._last_activity
 
                 if idle >= DISCONNECT_AFTER:
                     log.info(
@@ -405,25 +458,34 @@ class RealtimeBridge:
                         idle_seconds=round(idle, 1),
                     )
                     # Say goodbye before closing the connection
-                    if self._realtime_ws and not self._response_active:
+                    if self._realtime_ws:
                         try:
-                            await self._realtime_ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "response.create",
-                                        "response": {
-                                            "instructions": (
-                                                "The user has been inactive for a while and the session "
-                                                "is ending. Say a brief, warm goodbye — something like "
-                                                '"It was nice chatting! Feel free to reconnect whenever '
-                                                "you'd like to talk again.\" Keep it to one sentence."
-                                            ),
-                                        },
-                                    }
+                            async with self._response_create_lock:
+                                await self._response_done.wait()
+                                await self._realtime_ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "response.create",
+                                            "response": {
+                                                "instructions": (
+                                                    "The user has been inactive for a while and the session "
+                                                    "is ending. Say a brief, warm goodbye — something like "
+                                                    '"It was nice chatting! Feel free to reconnect whenever '
+                                                    "you'd like to talk again.\" Keep it to one sentence."
+                                                ),
+                                            },
+                                        }
+                                    )
                                 )
-                            )
-                            # Give the Responder a moment to generate the sign-off audio
-                            await asyncio.sleep(5)
+                                # Mark response as in-flight so the wait below
+                                # actually blocks until response.done arrives.
+                                # Without this, _response_done is still set from
+                                # the wait above and .wait() returns immediately.
+                                self._response_done.clear()
+                                try:
+                                    await asyncio.wait_for(self._response_done.wait(), timeout=8.0)
+                                except asyncio.TimeoutError:
+                                    pass
                         except websockets.exceptions.ConnectionClosed:
                             pass
                     self.event_queue.put_nowait({"type": "session_idle_disconnect"})
@@ -441,21 +503,23 @@ class RealtimeBridge:
                     )
                     self.event_queue.put_nowait({"type": "session_idle_nudge"})
                     # Ask the Responder to gently check in with the user
-                    await self._realtime_ws.send(
-                        json.dumps(
-                            {
-                                "type": "response.create",
-                                "response": {
-                                    "instructions": (
-                                        "The user has been quiet for a moment. "
-                                        "Gently check in — ask if they're still there "
-                                        "or if there's anything else you can help with. "
-                                        "Keep it brief and warm."
-                                    ),
-                                },
-                            }
+                    async with self._response_create_lock:
+                        await self._response_done.wait()
+                        await self._realtime_ws.send(
+                            json.dumps(
+                                {
+                                    "type": "response.create",
+                                    "response": {
+                                        "instructions": (
+                                            "The user has been quiet for a moment. "
+                                            "Gently check in — ask if they're still there "
+                                            "or if there's anything else you can help with. "
+                                            "Keep it brief and warm."
+                                        ),
+                                    },
+                                }
+                            )
                         )
-                    )
         except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
             pass
 
@@ -471,7 +535,7 @@ class RealtimeBridge:
             return
 
         # Convert 24kHz PCM16 base64 → 48kHz aiortc AudioFrame
-        frame = realtime_b64_to_aiortc_frame(audio_b64)
+        frame = self._audio_converter.realtime_b64_to_aiortc_frame(audio_b64)
         await self.audio_track.output_track.push_frame(frame)
 
     async def _handle_interrupt(self):
@@ -642,33 +706,39 @@ class RealtimeBridge:
             )
             return
 
-        # ── Guard 2: wait for any in-flight response to finish ──
-        # The Realtime API silently drops response.create while it is
-        # already generating a response (e.g. the "let me check" filler).
-        # This is the primary cause of the "thinker came back but the
-        # Responder didn't say anything" bug.
-        try:
-            await asyncio.wait_for(self._response_done.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            log.warning(
-                "bridge.response_wait_timeout",
-                session_id=self.session_id,
-                domain=domain,
-            )
+        # ── Guards 2 & 3: serialized response.create ──
+        # Acquire the lock so that only one caller (thinker, idle nudge,
+        # idle disconnect) can send response.create at a time. Without this
+        # lock, concurrent senders race on _response_done and the API
+        # silently drops the overlapping request.
+        async with self._response_create_lock:
+            # Guard 2: wait for any in-flight response to finish.
+            # The Realtime API silently drops response.create while it is
+            # already generating a response (e.g. the "let me check" filler).
+            # This is the primary cause of the "thinker came back but the
+            # Responder didn't say anything" bug.
+            try:
+                await asyncio.wait_for(self._response_done.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "bridge.response_wait_timeout",
+                    session_id=self.session_id,
+                    domain=domain,
+                )
 
-        # ── Guard 3: re-check staleness after waiting ──
-        # The user could have interrupted while we were waiting for the
-        # active response to finish.
-        if self._turn_id != dispatched_turn_id:
-            log.info(
-                "bridge.thinker_stale_after_wait",
-                session_id=self.session_id,
-                domain=domain,
-            )
-            return
+            # Guard 3: re-check staleness after waiting.
+            # The user could have interrupted while we were waiting for the
+            # active response to finish or for the lock.
+            if self._turn_id != dispatched_turn_id:
+                log.info(
+                    "bridge.thinker_stale_after_wait",
+                    session_id=self.session_id,
+                    domain=domain,
+                )
+                return
 
-        # Trigger the Responder to generate a response based on the Thinker output
-        await self._realtime_ws.send(json.dumps({"type": "response.create"}))
+            # Trigger the Responder to generate a response based on the Thinker output
+            await self._realtime_ws.send(json.dumps({"type": "response.create"}))
 
     async def cleanup(self):
         """Clean up resources."""

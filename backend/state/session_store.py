@@ -13,6 +13,7 @@ Redis is the right choice here because:
   - In production, this scales horizontally across backend instances
 """
 
+import hashlib
 import json
 import time
 
@@ -70,7 +71,7 @@ class SessionStore:
         result: str,
     ):
         """Cache a Thinker result to avoid redundant calls. Shared across all sessions."""
-        query_hash = str(hash(query))[:12]
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
         key = CACHE_KEY.format(
             domain=domain,
             query_hash=query_hash,
@@ -84,7 +85,7 @@ class SessionStore:
 
     async def get_cached_result(self, domain: str, query: str) -> str | None:
         """Check for a cached Thinker result. Shared across all sessions."""
-        query_hash = str(hash(query))[:12]
+        query_hash = hashlib.sha256(query.encode()).hexdigest()[:16]
         key = CACHE_KEY.format(
             domain=domain,
             query_hash=query_hash,

@@ -34,3 +34,22 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def make_openai_client() -> "AsyncOpenAI":
+    """
+    Create an AsyncOpenAI client, optionally wrapped with LangSmith tracing.
+
+    Wrapping is only applied when tracing is enabled — avoids unnecessary
+    overhead on every API call in non-traced environments.
+    """
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1")
+
+    if settings.langsmith_tracing_enabled:
+        from langsmith.wrappers import wrap_openai
+
+        client = wrap_openai(client)
+
+    return client

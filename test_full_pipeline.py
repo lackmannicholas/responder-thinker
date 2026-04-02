@@ -25,10 +25,9 @@ from aiortc.contrib.media import MediaRelay
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from backend.transport.audio_convert import (
-    aiortc_frame_to_realtime_b64,
-    realtime_b64_to_aiortc_frame,
-)
+from backend.audio_convert import AudioConverter
+
+_converter = AudioConverter()
 
 app = FastAPI()
 relay = MediaRelay()
@@ -61,29 +60,28 @@ async def run_bridge(input_track: MediaStreamTrack, output_track: RealtimeOutput
         "OpenAI-Beta": "realtime=v1",
     }
 
-    async with websockets.connect(
-        f"{REALTIME_URL}?model={MODEL}", extra_headers=headers
-    ) as ws:
+    async with websockets.connect(f"{REALTIME_URL}?model={MODEL}", extra_headers=headers) as ws:
         # Configure session — minimal, just audio
-        await ws.send(json.dumps({
-            "type": "session.update",
-            "session": {
-                "modalities": ["text", "audio"],
-                "instructions": (
-                    "You are a friendly assistant. Keep responses very short. "
-                    "This is a test of the audio pipeline."
-                ),
-                "voice": "alloy",
-                "input_audio_format": "pcm16",
-                "output_audio_format": "pcm16",
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.5,
-                    "prefix_padding_ms": 300,
-                    "silence_duration_ms": 500,
-                },
-            },
-        }))
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "modalities": ["text", "audio"],
+                        "instructions": ("You are a friendly assistant. Keep responses very short. " "This is a test of the audio pipeline."),
+                        "voice": "alloy",
+                        "input_audio_format": "pcm16",
+                        "output_audio_format": "pcm16",
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": 0.5,
+                            "prefix_padding_ms": 300,
+                            "silence_duration_ms": 500,
+                        },
+                    },
+                }
+            )
+        )
 
         print("✓ Realtime API session configured")
 
@@ -92,11 +90,15 @@ async def run_bridge(input_track: MediaStreamTrack, output_track: RealtimeOutput
             try:
                 while True:
                     frame = await input_track.recv()
-                    audio_b64 = aiortc_frame_to_realtime_b64(frame)
-                    await ws.send(json.dumps({
-                        "type": "input_audio_buffer.append",
-                        "audio": audio_b64,
-                    }))
+                    audio_b64 = _converter.aiortc_frame_to_realtime_b64(frame)
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "type": "input_audio_buffer.append",
+                                "audio": audio_b64,
+                            }
+                        )
+                    )
             except Exception as e:
                 print(f"Send audio error: {e}")
 
@@ -110,7 +112,7 @@ async def run_bridge(input_track: MediaStreamTrack, output_track: RealtimeOutput
                     if event_type == "response.audio.delta":
                         delta = event.get("delta", "")
                         if delta:
-                            frame = realtime_b64_to_aiortc_frame(delta)
+                            frame = _converter.realtime_b64_to_aiortc_frame(delta)
                             await output_track.push(frame)
 
                     elif event_type == "response.audio_transcript.done":
@@ -147,9 +149,7 @@ async def offer(request: dict):
             input_track_holder[0] = relay.subscribe(track)
             print(f"✓ Got browser audio track")
             # Start the bridge once we have the audio track
-            asyncio.ensure_future(
-                run_bridge(input_track_holder[0], output_track)
-            )
+            asyncio.ensure_future(run_bridge(input_track_holder[0], output_track))
 
     @pc.on("connectionstatechange")
     async def on_state():
@@ -168,7 +168,8 @@ async def offer(request: dict):
 
 @app.get("/")
 async def index():
-    return HTMLResponse("""
+    return HTMLResponse(
+        """
 <!DOCTYPE html>
 <html>
 <head><title>Full Pipeline Test</title></head>
@@ -235,4 +236,5 @@ async def index():
     </script>
 </body>
 </html>
-    """)
+    """
+    )

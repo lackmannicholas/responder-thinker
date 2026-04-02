@@ -7,14 +7,12 @@ more reasoning than simple data lookups.
 
 import json
 
-from openai import AsyncOpenAI
 from langsmith import traceable
-from langsmith.wrappers import wrap_openai
 
-from backend.config import settings
+from backend.config import settings, make_openai_client
 from backend.thinkers.base import BaseThinker
 
-client = wrap_openai(AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1"))
+client = make_openai_client()
 
 NEWS_TOOLS = [
     {
@@ -105,26 +103,93 @@ class NewsThinker(BaseThinker):
         """
         topic = args.get("topic", "general")
         count = min(args.get("count", 3), 5)
-        return {
-            "topic": topic,
-            "headlines": [
+
+        # Pre-built mock headlines by topic for a more convincing demo.
+        # Generic fallback for unknown topics.
+        topic_headlines = {
+            "ai": [
                 {
-                    "title": f"Breaking: Major development in {topic} sector",
+                    "title": "OpenAI Releases New Real-Time Voice Model With Tool-Use Support",
                     "source": "Reuters",
                     "published": "2 hours ago",
-                    "summary": (f"Experts are closely watching developments in {topic} " "as new information emerges."),
+                    "summary": "The latest model supports function calling during live audio sessions, enabling more complex voice agent workflows.",
                 },
                 {
-                    "title": f"Analysis: What recent {topic} trends mean for the future",
-                    "source": "AP News",
+                    "title": "EU AI Act Enforcement Begins With First Round of Compliance Audits",
+                    "source": "Financial Times",
+                    "published": "5 hours ago",
+                    "summary": "European regulators have started auditing major AI providers under the new framework.",
+                },
+                {
+                    "title": "Google DeepMind Publishes Breakthrough in Long-Context Reasoning",
+                    "source": "Ars Technica",
+                    "published": "8 hours ago",
+                    "summary": "A new architecture enables reliable reasoning across million-token context windows.",
+                },
+            ],
+            "economy": [
+                {
+                    "title": "Federal Reserve Holds Rates Steady, Signals Potential Cut in September",
+                    "source": "Wall Street Journal",
+                    "published": "1 hour ago",
+                    "summary": "The Fed kept the benchmark rate unchanged but indicated easing could begin later this year.",
+                },
+                {
+                    "title": "US Jobs Report Shows Stronger-Than-Expected Hiring in Services Sector",
+                    "source": "Bloomberg",
                     "published": "4 hours ago",
-                    "summary": (f"Analysts weigh in on the implications of the latest " f"{topic} developments."),
+                    "summary": "Nonfarm payrolls beat estimates with particular strength in healthcare and hospitality.",
                 },
                 {
-                    "title": f"{topic.capitalize()} update: Key stakeholders respond",
-                    "source": "BBC",
+                    "title": "Housing Starts Rise for Third Consecutive Month Amid Easing Lumber Costs",
+                    "source": "CNBC",
                     "published": "6 hours ago",
-                    "summary": (f"Reactions continue to pour in following the latest " f"news on {topic}."),
+                    "summary": "Builders are responding to lower material costs, though affordability remains strained for buyers.",
                 },
-            ][:count],
+            ],
+            "sports": [
+                {
+                    "title": "NBA Finals Game 5: Celtics Take 3-2 Series Lead in Overtime Thriller",
+                    "source": "ESPN",
+                    "published": "3 hours ago",
+                    "summary": "A buzzer-beating three-pointer sent the game to overtime where Boston pulled away late.",
+                },
+                {
+                    "title": "FIFA Announces Expanded Club World Cup Format for 2027",
+                    "source": "BBC Sport",
+                    "published": "5 hours ago",
+                    "summary": "The tournament will feature 48 clubs across six confederations in the new format.",
+                },
+                {
+                    "title": "MLB Trade Deadline: Yankees Acquire All-Star Pitcher in Blockbuster Deal",
+                    "source": "The Athletic",
+                    "published": "7 hours ago",
+                    "summary": "New York sent a package of top prospects to secure a front-line starter for the playoff push.",
+                },
+            ],
         }
+
+        # Normalize topic for lookup, fall back to generic headlines
+        normalized = topic.lower().strip()
+        headlines = topic_headlines.get(normalized, [
+            {
+                "title": f"Major Policy Shift Expected in {topic.capitalize()} Sector This Quarter",
+                "source": "Reuters",
+                "published": "2 hours ago",
+                "summary": f"Industry leaders are responding to new regulatory signals affecting {topic}.",
+            },
+            {
+                "title": f"New Research Challenges Conventional Thinking on {topic.capitalize()}",
+                "source": "Associated Press",
+                "published": "4 hours ago",
+                "summary": f"A peer-reviewed study offers findings that could reshape how experts approach {topic}.",
+            },
+            {
+                "title": f"Global Summit on {topic.capitalize()} Draws Record Attendance",
+                "source": "BBC",
+                "published": "6 hours ago",
+                "summary": f"Delegates from over 40 countries gathered to discuss the future of {topic}.",
+            },
+        ])
+
+        return {"topic": topic, "headlines": headlines[:count]}
