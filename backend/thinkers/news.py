@@ -1,48 +1,180 @@
 """
 News Thinker — handles news and current events queries.
 
+Uses the OpenAI Agents SDK with local function tools that call the NewsAPI.org API.
+Requires NEWSAPI_API_KEY env var (free tier: 100 req/day, https://newsapi.org/register).
 Uses gpt-4.1 (advanced model) because news summarization requires
 more reasoning than simple data lookups.
 """
 
 import json
+from datetime import datetime, timedelta, timezone
 
+import httpx
+from agents import Agent, Runner, function_tool
 from langsmith import traceable
 
-from backend.config import settings, make_openai_client
+from backend.config import settings
 from backend.thinkers.base import BaseThinker
 
-client = make_openai_client()
+_NEWSAPI_BASE = "https://newsapi.org/v2"
 
-NEWS_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_news_headlines",
-            "description": "Get recent news headlines for a topic or keyword.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {
-                        "type": "string",
-                        "description": "The topic or search query, e.g. 'AI', 'economy', 'sports'",
-                    },
-                    "count": {
-                        "type": "integer",
-                        "description": "Number of headlines to retrieve (1-5)",
-                        "default": 3,
-                    },
+
+_MOCK_HEADLINES: dict[str, list[dict]] = {
+    "ai": [
+        {"title": "OpenAI Releases New Real-Time Voice Model With Tool-Use Support", "source": "Reuters", "published_at": "2 hours ago"},
+        {"title": "EU AI Act Enforcement Begins With First Round of Compliance Audits", "source": "Financial Times", "published_at": "5 hours ago"},
+        {"title": "Google DeepMind Publishes Breakthrough in Long-Context Reasoning", "source": "Ars Technica", "published_at": "8 hours ago"},
+    ],
+    "economy": [
+        {"title": "Federal Reserve Holds Rates Steady, Signals Potential Cut in September", "source": "Wall Street Journal", "published_at": "1 hour ago"},
+        {"title": "US Jobs Report Shows Stronger-Than-Expected Hiring in Services Sector", "source": "Bloomberg", "published_at": "4 hours ago"},
+    ],
+    "sports": [
+        {"title": "NBA Finals Game 5: Celtics Take 3-2 Series Lead in Overtime Thriller", "source": "ESPN", "published_at": "3 hours ago"},
+        {"title": "FIFA Announces Expanded Club World Cup Format for 2027", "source": "BBC Sport", "published_at": "5 hours ago"},
+    ],
+}
+
+
+def _mock_headlines(topic: str, count: int = 3) -> str:
+    normalized = topic.lower().strip()
+    headlines = _MOCK_HEADLINES.get(
+        normalized,
+        [
+            {"title": f"Major Developments Expected in {topic.capitalize()} This Quarter", "source": "Reuters", "published_at": "2 hours ago"},
+            {"title": f"New Research Challenges Conventional Thinking on {topic.capitalize()}", "source": "AP", "published_at": "4 hours ago"},
+        ],
+    )
+    return json.dumps(
+        {
+            "topic": topic,
+            "headlines": headlines[:count],
+            "note": "mock data — set NEWSAPI_API_KEY for live headlines",
+        }
+    )
+
+
+def _mock_category(category: str, count: int = 3) -> str:
+    return json.dumps(
+        {
+            "category": category,
+            "country": "us",
+            "headlines": _MOCK_HEADLINES.get(category.lower(), _MOCK_HEADLINES.get("economy", []))[:count],
+            "note": "mock data — set NEWSAPI_API_KEY for live headlines",
+        }
+    )
+
+
+@function_tool
+async def get_top_headlines(topic: str, count: int = 3) -> str:
+    """Get recent top headlines for a topic or keyword.
+
+    Args:
+        topic: The topic or search query, e.g. 'AI', 'economy', 'sports'
+        count: Number of headlines to return (1-10)
+    """
+    api_key = settings.newsapi_api_key
+    if not api_key:
+        return _mock_headlines(topic, count)
+
+    count = max(1, min(count, 10))
+    from_date = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_NEWSAPI_BASE}/everything",
+                params={
+                    "q": topic,
+                    "from": from_date,
+                    "sortBy": "publishedAt",
+                    "pageSize": count,
+                    "language": "en",
+                    "apiKey": api_key,
                 },
-                "required": ["topic"],
-            },
-        },
-    },
-]
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("status") != "ok":
+                return json.dumps({"error": data.get("message", "NewsAPI request failed")})
+
+            headlines = []
+            for article in data.get("articles", [])[:count]:
+                headlines.append(
+                    {
+                        "title": article.get("title", ""),
+                        "source": article.get("source", {}).get("name", "Unknown"),
+                        "published_at": article.get("publishedAt", ""),
+                        "description": article.get("description", ""),
+                        "url": article.get("url", ""),
+                    }
+                )
+
+            return json.dumps({"topic": topic, "headlines": headlines})
+    except Exception:
+        return _mock_headlines(topic, count)
+
+
+@function_tool
+async def get_headlines_by_category(category: str, country: str = "us", count: int = 3) -> str:
+    """Get top headlines by news category.
+
+    Args:
+        category: One of: business, entertainment, general, health, science, sports, technology
+        country: ISO 3166-1 alpha-2 country code, e.g. 'us', 'gb', 'de'
+        count: Number of headlines to return (1-10)
+    """
+    api_key = settings.newsapi_api_key
+    if not api_key:
+        return _mock_category(category, count)
+
+    count = max(1, min(count, 10))
+    valid_categories = {"business", "entertainment", "general", "health", "science", "sports", "technology"}
+    if category.lower() not in valid_categories:
+        return json.dumps({"error": f"Invalid category. Must be one of: {', '.join(sorted(valid_categories))}"})
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{_NEWSAPI_BASE}/top-headlines",
+                params={
+                    "category": category.lower(),
+                    "country": country.lower(),
+                    "pageSize": count,
+                    "apiKey": api_key,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            if data.get("status") != "ok":
+                return json.dumps({"error": data.get("message", "NewsAPI request failed")})
+
+            headlines = []
+            for article in data.get("articles", [])[:count]:
+                headlines.append(
+                    {
+                        "title": article.get("title", ""),
+                        "source": article.get("source", {}).get("name", "Unknown"),
+                        "published_at": article.get("publishedAt", ""),
+                        "description": article.get("description", ""),
+                    }
+                )
+
+            return json.dumps({"category": category, "country": country, "headlines": headlines})
+    except Exception:
+        return _mock_category(category, count)
+
 
 NEWS_SYSTEM_PROMPT = """\
 You are a news briefing specialist. Given a user's question about current events \
-or news, use the get_news_headlines tool to fetch recent headlines, then provide \
+or news, use the available tools to fetch recent headlines, then provide \
 a brief spoken summary of the key story or stories.
+
+Use get_top_headlines for topic-based searches. Use get_headlines_by_category \
+when the user asks about a broad category like "business news" or "sports news".
 
 Keep your response to 3-4 sentences max. This will be read aloud by a voice agent.
 Do NOT use bullet points, lists, or formatting. Just natural speech.
@@ -57,139 +189,11 @@ class NewsThinker(BaseThinker):
 
     @traceable(name="news_thinker.think")
     async def think(self, query: str, context: list[dict]) -> str:
-        messages = [
-            {"role": "system", "content": NEWS_SYSTEM_PROMPT},
-            {"role": "user", "content": query},
-        ]
-
-        response = await client.chat.completions.create(
+        agent = Agent(
+            name="News Specialist",
+            instructions=NEWS_SYSTEM_PROMPT,
             model=self.model,
-            messages=messages,
-            tools=NEWS_TOOLS,
-            tool_choice="auto",
+            tools=[get_top_headlines, get_headlines_by_category],
         )
-
-        message = response.choices[0].message
-
-        if message.tool_calls:
-            messages.append(message)
-            for tool_call in message.tool_calls:
-                if tool_call.function.name == "get_news_headlines":
-                    args = json.loads(tool_call.function.arguments)
-                    # TODO: Replace with real API call (NewsAPI, GNews, etc.)
-                    news_data = await self._mock_headlines(args)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps(news_data),
-                        }
-                    )
-
-            final = await client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-            )
-            return final.choices[0].message.content
-
-        return message.content or "I couldn't find recent news on that topic."
-
-    async def _mock_headlines(self, args: dict) -> dict:
-        """
-        Mock news data. Replace with a real API call.
-
-        TODO: Integrate with NewsAPI, GNews, or similar.
-        Cache results in Redis with a 5-minute TTL.
-        """
-        topic = args.get("topic", "general")
-        count = min(args.get("count", 3), 5)
-
-        # Pre-built mock headlines by topic for a more convincing demo.
-        # Generic fallback for unknown topics.
-        topic_headlines = {
-            "ai": [
-                {
-                    "title": "OpenAI Releases New Real-Time Voice Model With Tool-Use Support",
-                    "source": "Reuters",
-                    "published": "2 hours ago",
-                    "summary": "The latest model supports function calling during live audio sessions, enabling more complex voice agent workflows.",
-                },
-                {
-                    "title": "EU AI Act Enforcement Begins With First Round of Compliance Audits",
-                    "source": "Financial Times",
-                    "published": "5 hours ago",
-                    "summary": "European regulators have started auditing major AI providers under the new framework.",
-                },
-                {
-                    "title": "Google DeepMind Publishes Breakthrough in Long-Context Reasoning",
-                    "source": "Ars Technica",
-                    "published": "8 hours ago",
-                    "summary": "A new architecture enables reliable reasoning across million-token context windows.",
-                },
-            ],
-            "economy": [
-                {
-                    "title": "Federal Reserve Holds Rates Steady, Signals Potential Cut in September",
-                    "source": "Wall Street Journal",
-                    "published": "1 hour ago",
-                    "summary": "The Fed kept the benchmark rate unchanged but indicated easing could begin later this year.",
-                },
-                {
-                    "title": "US Jobs Report Shows Stronger-Than-Expected Hiring in Services Sector",
-                    "source": "Bloomberg",
-                    "published": "4 hours ago",
-                    "summary": "Nonfarm payrolls beat estimates with particular strength in healthcare and hospitality.",
-                },
-                {
-                    "title": "Housing Starts Rise for Third Consecutive Month Amid Easing Lumber Costs",
-                    "source": "CNBC",
-                    "published": "6 hours ago",
-                    "summary": "Builders are responding to lower material costs, though affordability remains strained for buyers.",
-                },
-            ],
-            "sports": [
-                {
-                    "title": "NBA Finals Game 5: Celtics Take 3-2 Series Lead in Overtime Thriller",
-                    "source": "ESPN",
-                    "published": "3 hours ago",
-                    "summary": "A buzzer-beating three-pointer sent the game to overtime where Boston pulled away late.",
-                },
-                {
-                    "title": "FIFA Announces Expanded Club World Cup Format for 2027",
-                    "source": "BBC Sport",
-                    "published": "5 hours ago",
-                    "summary": "The tournament will feature 48 clubs across six confederations in the new format.",
-                },
-                {
-                    "title": "MLB Trade Deadline: Yankees Acquire All-Star Pitcher in Blockbuster Deal",
-                    "source": "The Athletic",
-                    "published": "7 hours ago",
-                    "summary": "New York sent a package of top prospects to secure a front-line starter for the playoff push.",
-                },
-            ],
-        }
-
-        # Normalize topic for lookup, fall back to generic headlines
-        normalized = topic.lower().strip()
-        headlines = topic_headlines.get(normalized, [
-            {
-                "title": f"Major Policy Shift Expected in {topic.capitalize()} Sector This Quarter",
-                "source": "Reuters",
-                "published": "2 hours ago",
-                "summary": f"Industry leaders are responding to new regulatory signals affecting {topic}.",
-            },
-            {
-                "title": f"New Research Challenges Conventional Thinking on {topic.capitalize()}",
-                "source": "Associated Press",
-                "published": "4 hours ago",
-                "summary": f"A peer-reviewed study offers findings that could reshape how experts approach {topic}.",
-            },
-            {
-                "title": f"Global Summit on {topic.capitalize()} Draws Record Attendance",
-                "source": "BBC",
-                "published": "6 hours ago",
-                "summary": f"Delegates from over 40 countries gathered to discuss the future of {topic}.",
-            },
-        ])
-
-        return {"topic": topic, "headlines": headlines[:count]}
+        result = await Runner.run(agent, query)
+        return result.final_output

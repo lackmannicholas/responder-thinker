@@ -11,9 +11,9 @@ from abc import ABC, abstractmethod
 class BaseThinker(ABC):
     """Abstract base for all Thinker agents."""
 
-    domain: str          # Unique identifier used for routing, e.g. "weather"
-    description: str     # Human-readable purpose
-    model: str           # OpenAI model ID
+    domain: str  # Unique identifier used for routing, e.g. "weather"
+    description: str  # Human-readable purpose
+    model: str  # OpenAI model ID
 
     @abstractmethod
     async def think(self, query: str, context: list[dict]) -> str:

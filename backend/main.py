@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from starlette.responses import StreamingResponse
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from backend.config import settings
+from backend.config import settings, make_openai_client
 from backend.transport.webrtc_server import WebRTCServer
 from backend.transport.realtime_bridge import RealtimeBridge
 from backend.thinkers.router import ThinkerRouter
@@ -41,6 +41,13 @@ _bridges: dict[str, RealtimeBridge] = {}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     setup_tracing()
+
+    # Set the Agents SDK's default OpenAI client so all thinkers
+    # use the correct regional endpoint and LangSmith wrapping.
+    from agents import set_default_openai_client
+
+    set_default_openai_client(make_openai_client())
+
     await session_store.connect()
     log.info("responder_thinker.started", model=settings.realtime_model)
     yield

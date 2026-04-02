@@ -2,7 +2,14 @@
 Application settings loaded from environment variables / .env file.
 """
 
+import os
+
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load .env into os.environ so third-party libraries (openai-agents SDK, etc.)
+# can read OPENAI_API_KEY and other vars directly from the environment.
+load_dotenv()
 
 
 class Settings(BaseSettings):
@@ -10,6 +17,7 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str
+    openai_base_url: str = "https://us.api.openai.com/v1"
 
     # Realtime API (the Responder)
     # Use a versioned model name — the undated alias is sometimes rejected.
@@ -27,6 +35,10 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379"
 
+    # External API keys for thinker tools
+    finnhub_api_key: str = ""  # https://finnhub.io/register (free: 60 req/min)
+    newsapi_api_key: str = ""  # https://newsapi.org/register (free: 100 req/day)
+
     # LangSmith observability (optional)
     langsmith_api_key: str = ""
     langsmith_project: str = "responder-thinker"
@@ -34,6 +46,9 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Disable the Agents SDK's built-in tracing — we use LangSmith instead.
+# os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
 
 def make_openai_client() -> "AsyncOpenAI":
@@ -45,7 +60,7 @@ def make_openai_client() -> "AsyncOpenAI":
     """
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI(api_key=settings.openai_api_key, base_url="https://us.api.openai.com/v1")
+    client = AsyncOpenAI(api_key=settings.openai_api_key, base_url=settings.openai_base_url)
 
     if settings.langsmith_tracing_enabled:
         from langsmith.wrappers import wrap_openai
