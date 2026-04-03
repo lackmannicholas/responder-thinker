@@ -27,7 +27,8 @@ from langsmith.run_helpers import trace
 import re
 
 from backend.config import settings
-from backend.audio_convert import AudioConverter
+from backend.audio_convert import AudioConverter, pcm16_bytes_to_b64
+from backend.vad import VADGate
 from backend.thinkers.router import ThinkerRouter
 from backend.state.session_store import SessionStore
 from backend.state.user_context import ContextUpdate, UserContext
@@ -142,6 +143,11 @@ class RealtimeBridge:
         # Per-session audio converter — resamplers are stateful and must not
         # be shared across concurrent sessions.
         self._audio_converter = AudioConverter()
+
+        # Per-session VAD gate — None when VAD is disabled
+        self._vad_gate: VADGate | None = (
+            VADGate(settings.vad) if settings.vad.enabled else None
+        )
 
         # Coordination: monotonic turn counter to detect stale thinker results
         self._turn_id: int = 0
@@ -524,21 +530,24 @@ class RealtimeBridge:
                 try:
                     frame = await input_track.recv()
 
-                    # Convert aiortc AudioFrame → 24kHz mono PCM16 base64
-                    audio_b64 = self._audio_converter.aiortc_frame_to_realtime_b64(frame)
+                    # Convert aiortc AudioFrame → raw 24kHz mono PCM16 bytes
+                    pcm16_bytes = self._audio_converter.aiortc_frame_to_pcm16(frame)
 
                     # Skip empty frames (resampler may buffer on first call)
-                    if not audio_b64:
+                    if not pcm16_bytes:
                         continue
 
-                    await self._realtime_ws.send(
-                        json.dumps(
-                            {
-                                "type": "input_audio_buffer.append",
-                                "audio": audio_b64,
-                            }
-                        )
-                    )
+                    if self._vad_gate is not None:
+                        result = self._vad_gate.process(pcm16_bytes)
+                        chunks_to_send = result.frames_to_flush
+                    else:
+                        chunks_to_send = [pcm16_bytes]
+
+                    for chunk in chunks_to_send:
+                        await self._realtime_ws.send(json.dumps({
+                            "type": "input_audio_buffer.append",
+                            "audio": pcm16_bytes_to_b64(chunk),
+                        }))
                 except (av.error.InvalidDataError, ValueError, IndexError, TypeError) as e:
                     # Transient audio frame errors — log and continue, don't kill the session
                     log.warning("bridge.audio_frame_error", error=str(e), session_id=self.session_id)
