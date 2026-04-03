@@ -71,6 +71,29 @@ class AudioConverter:
         audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
         return base64.b64encode(audio.tobytes()).decode("utf-8")
 
+    def aiortc_frame_to_pcm16(self, frame: av.AudioFrame) -> bytes:
+        """
+        Convert an aiortc AudioFrame to raw PCM16 bytes at 24kHz mono.
+
+        Uses the same stateful downsampler as aiortc_frame_to_realtime_b64.
+        Returns empty bytes b"" if the resampler is still buffering (first call).
+
+        Caller is responsible for base64 encoding if the Realtime API is the
+        destination. Use audio_convert.pcm16_bytes_to_b64(pcm_bytes) for that.
+        """
+        resampled_frames = self._downsampler.resample(frame)
+
+        if not resampled_frames:
+            return b""
+
+        chunks = []
+        for rf in resampled_frames:
+            audio = rf.to_ndarray().flatten().astype(np.int16)
+            chunks.append(audio)
+
+        audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+        return audio.tobytes()
+
     def realtime_b64_to_aiortc_frame(self, audio_b64: str) -> av.AudioFrame:
         """
         Convert base64-encoded PCM16 from the Realtime API to an aiortc AudioFrame.

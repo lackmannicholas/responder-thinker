@@ -5,6 +5,7 @@ Application settings loaded from environment variables / .env file.
 import os
 
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Load .env into os.environ so third-party libraries (openai-agents SDK, etc.)
@@ -12,8 +13,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 load_dotenv()
 
 
+class VADConfig(BaseModel):
+    enabled: bool = True
+    threshold: float = 0.5
+    vad_sample_rate: int = 16000
+    vad_frame_ms: int = 32
+    pre_roll_ms: int = 100
+    post_roll_ms: int = 300
+    hangover_frames: int = 8
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", env_nested_delimiter="__")
 
     # OpenAI
     openai_api_key: str
@@ -43,6 +54,9 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "responder-thinker"
     langsmith_tracing_enabled: bool = False
+
+    # VAD
+    vad: VADConfig = VADConfig()
 
 
 settings = Settings()
