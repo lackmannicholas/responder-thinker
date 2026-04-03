@@ -13,6 +13,7 @@ from langsmith import traceable
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import ThinkResult, UserContext, ContextUpdate
 
 # WMO Weather interpretation codes → human-readable descriptions
 # https://open-meteo.com/en/docs
@@ -140,12 +141,41 @@ class WeatherThinker(BaseThinker):
     model = settings.thinker_model
 
     @traceable(name="weather_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
+        # Apply user preferences: default location and temperature unit
+        effective_query = query
+        prefs = user_context.preferences
+        hints: list[str] = []
+
+        if prefs.default_location:
+            hints.append(f"The user's default location is {prefs.default_location}.")
+        if prefs.temperature_unit:
+            hints.append(f"The user prefers {prefs.temperature_unit} temperatures.")
+
+        if hints:
+            effective_query = f"{query}\n\nUser preferences: {' '.join(hints)}"
+
         agent = Agent(
             name="Weather Specialist",
             instructions=WEATHER_SYSTEM_PROMPT,
             model=self.model,
             tools=[get_current_weather],
         )
-        result = await Runner.run(agent, query)
-        return result.final_output
+        result = await Runner.run(agent, effective_query)
+        response = result.final_output
+
+        # Extract location from the query for context updates
+        update = ContextUpdate()
+        # If the user explicitly named a location, persist it as their default
+        query_lower = query.lower()
+        # Simple heuristic: if query contains "in <location>" pattern, extract it
+        if " in " in query_lower:
+            location_part = query.split(" in ", 1)[-1].strip().rstrip("?.,!")
+            if location_part and len(location_part) < 60:
+                update.set_default_location = location_part
+                update.new_facts.append(f"Asked about weather in {location_part}")
+
+        return ThinkResult(
+            response=response,
+            context_update=update if not update.is_empty() else None,
+        )

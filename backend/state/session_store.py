@@ -20,12 +20,15 @@ import time
 import redis.asyncio as redis
 import structlog
 
+from backend.state.user_context import UserContext, ContextUpdate
+
 log = structlog.get_logger()
 
 # Key patterns
 CONVERSATION_KEY = "session:{session_id}:conversation"
 CACHE_KEY = "cache:{domain}:{query_hash}"
 METADATA_KEY = "session:{session_id}:meta"
+USER_CONTEXT_KEY = "user:{user_id}:context"
 
 # TTLs
 SESSION_TTL = 3600  # 1 hour
@@ -91,3 +94,45 @@ class SessionStore:
             query_hash=query_hash,
         )
         return await self._redis.get(key)
+
+    # ── User context (permanent, keyed by browser fingerprint) ──────────
+
+    async def get_user_context(self, user_id: str) -> UserContext:
+        """Load UserContext from Redis. Returns a fresh context if none exists."""
+        key = USER_CONTEXT_KEY.format(user_id=user_id)
+        raw = await self._redis.get(key)
+        if raw:
+            return UserContext.model_validate_json(raw)
+        return UserContext()
+
+    async def save_user_context(self, user_id: str, ctx: UserContext) -> None:
+        """Persist UserContext to Redis with no TTL (permanent)."""
+        key = USER_CONTEXT_KEY.format(user_id=user_id)
+        await self._redis.set(key, ctx.model_dump_json())
+
+    async def apply_context_update(self, user_id: str, update: ContextUpdate, source_domain: str) -> UserContext:
+        """
+        Merge a ContextUpdate into the stored UserContext and persist.
+
+        Returns the updated UserContext.
+        """
+        ctx = await self.get_user_context(user_id)
+
+        # Preferences — overwrite semantics
+        if update.set_name is not None:
+            ctx.preferences.name = update.set_name
+        if update.set_default_location is not None:
+            ctx.preferences.default_location = update.set_default_location
+        if update.set_temperature_unit is not None:
+            ctx.preferences.temperature_unit = update.set_temperature_unit
+        for ticker in update.add_watched_tickers:
+            t = ticker.upper().strip()
+            if t and t not in ctx.preferences.watched_tickers:
+                ctx.preferences.watched_tickers.append(t)
+
+        # Memory — append + dedup
+        for fact_text in update.new_facts:
+            ctx.memory.add_fact(fact_text, source_domain=source_domain)
+
+        await self.save_user_context(user_id, ctx)
+        return ctx

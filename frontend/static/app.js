@@ -20,6 +20,63 @@ let sessionId = null;
 let eventSource = null;
 let streamingTurn = null; // Current assistant bubble being streamed into
 
+// --- Browser Fingerprint ---
+// Generates a persistent fingerprint from browser-intrinsic signals.
+// Not meant to be cryptographic — just stable enough to recognize
+// the same browser across sessions for user context persistence.
+
+async function getBrowserFingerprint() {
+    const components = [];
+
+    // Canvas fingerprint
+    try {
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = 200;
+        canvas.height = 50;
+        ctx.textBaseline = 'top';
+        ctx.font = '14px Arial';
+        ctx.fillStyle = '#f60';
+        ctx.fillRect(0, 0, 100, 50);
+        ctx.fillStyle = '#069';
+        ctx.fillText('fingerprint', 2, 15);
+        ctx.fillStyle = 'rgba(102, 204, 0, 0.7)';
+        ctx.fillText('fingerprint', 4, 17);
+        components.push(canvas.toDataURL());
+    } catch (_) {
+        components.push('no-canvas');
+    }
+
+    // WebGL renderer
+    try {
+        const gl =
+            document.createElement('canvas').getContext('webgl') ||
+            document.createElement('canvas').getContext('experimental-webgl');
+        if (gl) {
+            const ext = gl.getExtension('WEBGL_debug_renderer_info');
+            if (ext) {
+                components.push(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL));
+            }
+        }
+    } catch (_) {
+        components.push('no-webgl');
+    }
+
+    // Platform signals
+    components.push(navigator.platform || '');
+    components.push(Intl.DateTimeFormat().resolvedOptions().timeZone || '');
+    components.push(`${screen.width}x${screen.height}x${screen.colorDepth}`);
+    components.push(navigator.language || '');
+    components.push(String(navigator.hardwareConcurrency || ''));
+
+    // Hash with SubtleCrypto (SHA-256)
+    const raw = components.join('|||');
+    const encoded = new TextEncoder().encode(raw);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 // --- UI Helpers ---
 
 function setStatus(state, text) {
@@ -158,10 +215,13 @@ async function connect() {
 
         addEvent('rtc', 'Sending SDP offer to backend');
 
+        const fingerprint = await getBrowserFingerprint();
+        addEvent('rtc', `Fingerprint: ${fingerprint.slice(0, 12)}...`);
+
         const response = await fetch('/api/rtc/offer', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sdp: peerConnection.localDescription.sdp }),
+            body: JSON.stringify({ sdp: peerConnection.localDescription.sdp, fingerprint }),
         });
 
         if (!response.ok) {

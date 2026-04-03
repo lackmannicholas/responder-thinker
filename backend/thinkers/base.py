@@ -7,6 +7,8 @@ and exposes a single async `think()` method.
 
 from abc import ABC, abstractmethod
 
+from backend.state.user_context import ThinkResult, UserContext
+
 
 class BaseThinker(ABC):
     """Abstract base for all Thinker agents."""
@@ -16,15 +18,17 @@ class BaseThinker(ABC):
     model: str  # OpenAI model ID
 
     @abstractmethod
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
         """
-        Process a query and return a spoken-word response.
+        Process a query and return a spoken-word response with optional context updates.
 
         Args:
-            query:   The user's question, rephrased by the Responder.
-            context: Recent conversation turns from Redis for grounding.
+            query:        The user's question, rephrased by the Responder.
+            context:      Recent conversation turns from Redis for grounding.
+            user_context: Persistent user preferences, memory, and signals.
 
         Returns:
-            A concise, naturally-spoken response (no markdown, no bullet points).
+            ThinkResult with a concise, naturally-spoken response and optional
+            ContextUpdate describing any user preferences/facts to persist.
         """
         ...

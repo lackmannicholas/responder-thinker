@@ -69,13 +69,14 @@ async def index():
 async def rtc_offer(request: dict):
     """
     WebRTC signaling endpoint.
-    Browser sends SDP offer, backend returns SDP answer.
+    Browser sends SDP offer + browser fingerprint, backend returns SDP answer.
     Once connected, audio flows: Browser <--WebRTC--> Backend.
     """
     session_id = str(uuid.uuid4())
     offer_sdp = request.get("sdp")
+    fingerprint = request.get("fingerprint")  # Browser fingerprint as user_id
 
-    log.info("rtc.offer_received", session_id=session_id)
+    log.info("rtc.offer_received", session_id=session_id, has_fingerprint=bool(fingerprint))
 
     # Create the WebRTC peer connection and get the answer SDP
     answer_sdp, session_tracks = await webrtc_server.create_session(
@@ -89,6 +90,7 @@ async def rtc_offer(request: dict):
         audio_track=session_tracks,
         thinker_router=thinker_router,
         session_store=session_store,
+        user_id=fingerprint,
     )
     _bridges[session_id] = bridge
 

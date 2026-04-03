@@ -24,12 +24,18 @@ import structlog
 import websockets
 from langsmith.run_helpers import trace
 
+import re
+
 from backend.config import settings
 from backend.audio_convert import AudioConverter
 from backend.thinkers.router import ThinkerRouter
 from backend.state.session_store import SessionStore
+from backend.state.user_context import ContextUpdate, UserContext
 
 log = structlog.get_logger()
+
+# How many new conversation turns between summary regenerations
+SUMMARY_INTERVAL = 10
 
 # OpenAI Realtime API WebSocket endpoint
 REALTIME_API_URL = "wss://us.api.openai.com/v1/realtime"
@@ -118,17 +124,20 @@ class RealtimeBridge:
         session_id: str,
         thinker_router: ThinkerRouter,
         session_store: SessionStore,
+        user_id: str | None = None,
         audio_track=None,  # SessionTracks from WebRTCServer
         websocket=None,  # WebSocket fallback
     ):
         self.session_id = session_id
         self.thinker_router = thinker_router
         self.session_store = session_store
+        self.user_id = user_id
         self.audio_track = audio_track
         self.websocket = websocket
         self._realtime_ws = None
         self._running = False
         self._response_active = False  # True while the API is generating a response
+        self._user_context: UserContext | None = None  # Loaded at session start
 
         # Per-session audio converter — resamplers are stateful and must not
         # be shared across concurrent sessions.
@@ -251,12 +260,28 @@ class RealtimeBridge:
 
     async def _configure_session(self):
         """Send initial session configuration to the Realtime API."""
+        # Load user context if we have a user_id (browser fingerprint)
+        instructions = RESPONDER_INSTRUCTIONS
+        if self.user_id:
+            self._user_context = await self.session_store.get_user_context(self.user_id)
+            self._user_context.signals.session_count += 1
+            await self.session_store.save_user_context(self.user_id, self._user_context)
+            instructions = self._build_system_prompt(self._user_context)
+            log.info(
+                "bridge.user_context_loaded",
+                session_id=self.session_id,
+                user_id=self.user_id[:12],
+                session_count=self._user_context.signals.session_count,
+                has_preferences=self._user_context.preferences.default_location is not None,
+                memory_facts=len(self._user_context.memory.facts),
+            )
+
         config = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
-                "instructions": RESPONDER_INSTRUCTIONS,
+                "instructions": instructions,
                 "audio": {
                     "input": {
                         "format": {
@@ -282,6 +307,198 @@ class RealtimeBridge:
         }
         await self._realtime_ws.send(json.dumps(config))
         log.info("bridge.session_configured", session_id=self.session_id)
+
+    def _build_system_prompt(self, ctx: UserContext) -> str:
+        """Build the Responder system prompt enriched with user context."""
+        sections = [RESPONDER_INSTRUCTIONS]
+
+        context_parts: list[str] = []
+
+        # Preferences
+        prefs = ctx.preferences
+        if prefs.name:
+            context_parts.append(f"- The user's name is {prefs.name}.")
+        if prefs.default_location:
+            context_parts.append(f"- Their default location is {prefs.default_location}.")
+        if prefs.temperature_unit != "fahrenheit":
+            context_parts.append(f"- They prefer temperatures in {prefs.temperature_unit}.")
+        if prefs.watched_tickers:
+            context_parts.append(f"- They follow these stocks: {', '.join(prefs.watched_tickers)}.")
+
+        # Memory facts
+        if ctx.memory.facts:
+            recent_facts = ctx.memory.facts[-10:]  # last 10 so prompt doesn't get huge
+            facts_str = "; ".join(f.fact for f in recent_facts)
+            context_parts.append(f"- Things you know about them: {facts_str}.")
+
+        # Conversation summary
+        if ctx.summary.text:
+            context_parts.append(f"- Conversation summary: {ctx.summary.text}")
+
+        # Session count
+        if ctx.signals.session_count > 1:
+            context_parts.append(
+                f"- This is session #{ctx.signals.session_count} with this user. " f"They're a returning user — feel free to reference things you know about them naturally."
+            )
+
+        if context_parts:
+            sections.append("\n## What you know about this user:\n" + "\n".join(context_parts))
+
+        return "\n".join(sections)
+
+    async def _update_responder_prompt(self, ctx: UserContext) -> None:
+        """Send a session.update to refresh the Responder's instructions mid-session."""
+        if not self._realtime_ws:
+            return
+        instructions = self._build_system_prompt(ctx)
+        await self._realtime_ws.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {"type": "realtime", "instructions": instructions},
+                }
+            )
+        )
+        log.info("bridge.prompt_updated", session_id=self.session_id)
+
+    async def _maybe_generate_summary(self) -> None:
+        """Generate a rolling conversation summary if enough new turns have elapsed."""
+        await self._generate_summary(force=False)
+
+    async def _generate_summary(self, force: bool = False) -> None:
+        """
+        Generate a rolling conversation summary.
+
+        Args:
+            force: If True, skip the turn-interval check (used on disconnect).
+        """
+        if not self.user_id or not self._user_context:
+            log.info("bridge.summary_skipped", session_id=self.session_id, reason="no_user_context", has_user_id=bool(self.user_id), has_context=bool(self._user_context))
+            return
+
+        try:
+            context = await self.session_store.get_conversation_context(self.session_id, max_turns=50)
+        except Exception as e:
+            log.warning("bridge.summary_context_error", session_id=self.session_id, error=str(e))
+            return
+
+        turn_count = len(context)
+
+        # Skip if no conversation happened at all
+        if turn_count == 0:
+            log.info("bridge.summary_skipped", session_id=self.session_id, reason="no_turns")
+            return
+
+        if not force and turn_count - self._user_context.summary.turn_count_at_summary < SUMMARY_INTERVAL:
+            return
+
+        log.info("bridge.generating_summary", session_id=self.session_id, turn_count=turn_count, force=force)
+
+        try:
+            from backend.config import make_openai_client
+
+            client = make_openai_client()
+            transcript = "\n".join(f"{t['role'].upper()}: {t['content']}" for t in context[-30:])
+            previous = self._user_context.summary.text
+            system = (
+                "You are maintaining a rolling summary of a user's conversations with a voice assistant. "
+                "Your job is to INTEGRATE the new conversation into the existing summary, preserving all "
+                "important prior context while adding new information. Do NOT discard or overwrite prior "
+                "details — merge them together.\n\n"
+                "Focus on: key topics discussed, user preferences revealed, facts learned about the user, "
+                "and any unresolved questions. Write in third person (e.g. 'The user asked about...'). "
+                "Keep the combined summary to 3-5 sentences."
+            )
+            if previous:
+                system += f"\n\nExisting summary to integrate with (DO NOT discard this):\n{previous}"
+
+            resp = await client.chat.completions.create(
+                model=settings.thinker_model,  # gpt-4.1-mini — cheap & fast
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": f"New conversation to integrate:\n{transcript}"},
+                ],
+            )
+            summary_text = resp.choices[0].message.content or ""
+
+            self._user_context.summary.text = summary_text
+            self._user_context.summary.turn_count_at_summary = turn_count
+            self._user_context.summary.updated_at = time.time()
+            await self.session_store.save_user_context(self.user_id, self._user_context)
+
+            # Only update the Responder prompt if the session is still active
+            if self._running:
+                await self._update_responder_prompt(self._user_context)
+
+            log.info("bridge.summary_generated", session_id=self.session_id, length=len(summary_text), force=force)
+        except Exception as e:
+            log.warning("bridge.summary_error", session_id=self.session_id, error=str(e))
+
+    # Patterns like "my name is Nick", "I'm Nick", "call me Nick", "this is Nick"
+    _NAME_PATTERNS = [
+        re.compile(r"\bmy name(?:'s| is) (\w+)", re.IGNORECASE),
+        re.compile(r"\bi'?m (\w+)\b", re.IGNORECASE),
+        re.compile(r"\bcall me (\w+)", re.IGNORECASE),
+        re.compile(r"\bthis is (\w+)", re.IGNORECASE),
+    ]
+    # Words that match the patterns but aren't names
+    _NAME_STOPWORDS = {
+        "fine",
+        "good",
+        "great",
+        "okay",
+        "ok",
+        "here",
+        "back",
+        "done",
+        "ready",
+        "sure",
+        "not",
+        "just",
+        "also",
+        "still",
+        "very",
+        "so",
+        "looking",
+        "wondering",
+        "curious",
+        "trying",
+        "going",
+        "asking",
+        "interested",
+        "happy",
+        "sorry",
+        "glad",
+        "excited",
+        "tired",
+        "a",
+        "the",
+        "an",
+        "your",
+        "new",
+    }
+
+    async def _extract_name_from_transcript(self, transcript: str) -> None:
+        """Extract the user's name from common introduction patterns and persist it."""
+        if not self.user_id or not self._user_context:
+            return
+        # Skip if we already know the name
+        if self._user_context.preferences.name:
+            return
+
+        for pattern in self._NAME_PATTERNS:
+            match = pattern.search(transcript)
+            if match:
+                name = match.group(1).strip()
+                if name.lower() in self._NAME_STOPWORDS or len(name) < 2:
+                    continue
+                # Capitalize properly
+                name = name.capitalize()
+                update = ContextUpdate(set_name=name)
+                self._user_context = await self.session_store.apply_context_update(self.user_id, update, source_domain="conversation")
+                await self._update_responder_prompt(self._user_context)
+                log.info("bridge.name_extracted", session_id=self.session_id, name=name)
+                return
 
     async def _audio_input_loop(self):
         """
@@ -405,6 +622,12 @@ class RealtimeBridge:
 
         except websockets.exceptions.ConnectionClosed:
             log.info("bridge.realtime_disconnected", session_id=self.session_id)
+
+        # WebSocket closed — generate summary while Redis and HTTP are still live
+        try:
+            await self._generate_summary(force=True)
+        except Exception as e:
+            log.error("bridge.disconnect_summary_failed", session_id=self.session_id, error=str(e))
 
     def _reset_idle_timer(self) -> None:
         """Reset idle timers when the user speaks."""
@@ -585,6 +808,9 @@ class RealtimeBridge:
             content=transcript,
         )
 
+        # Extract user's name from common introduction patterns
+        await self._extract_name_from_transcript(transcript)
+
         await self._start_turn(user_message=transcript, conversation_context=context)
 
         self.event_queue.put_nowait({"type": "transcript", "role": "user", "content": transcript})
@@ -620,6 +846,9 @@ class RealtimeBridge:
             role="assistant",
             transcript=transcript,
         )
+
+        # Periodically generate a rolling conversation summary
+        asyncio.create_task(self._maybe_generate_summary())
 
     async def _handle_tool_call(self, event: dict):
         """
@@ -669,12 +898,14 @@ class RealtimeBridge:
             metadata={"session_id": self.session_id, "domain": domain},
             parent=parent,
         ) as thinker_span:
-            result = await self.thinker_router.think(
+            think_result = await self.thinker_router.think(
                 domain=domain,
                 query=query,
                 context=context,
                 session_id=self.session_id,
+                user_id=self.user_id,
             )
+            result = think_result.response
             thinker_span.end(outputs={"result": result[:200] if result else ""})
         elapsed_ms = (time.monotonic() - start_time) * 1000
 
@@ -686,6 +917,12 @@ class RealtimeBridge:
         )
 
         self.event_queue.put_nowait({"type": "thinker", "event": "complete", "domain": domain, "elapsed_ms": round(elapsed_ms, 1)})
+
+        # If the thinker returned context updates, refresh the Responder's
+        # system prompt so it immediately knows what the thinkers learned.
+        if self.user_id and think_result.context_update and not think_result.context_update.is_empty():
+            self._user_context = await self.session_store.get_user_context(self.user_id)
+            await self._update_responder_prompt(self._user_context)
 
         # Always submit the tool output — the Realtime API expects a response
         # for every tool call regardless of whether the turn is still active.

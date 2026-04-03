@@ -23,6 +23,7 @@ from backend.thinkers.news import NewsThinker
 from backend.thinkers.knowledge import KnowledgeThinker
 from backend.thinkers.research import ResearchThinker
 from backend.state.session_store import SessionStore
+from backend.state.user_context import UserContext, ThinkResult
 
 log = structlog.get_logger()
 
@@ -55,12 +56,13 @@ class ThinkerRouter:
         query: str,
         context: list[dict],
         session_id: str,
-    ) -> str:
+        user_id: str | None = None,
+    ) -> ThinkResult:
         """
         Route a query to the appropriate Thinker.
 
-        Returns the Thinker's response as a string, ready for the
-        Responder to deliver via voice.
+        Returns a ThinkResult with the response and optional context updates.
+        If user_id is provided, loads/saves UserContext and tracks signals.
         """
         run_tree = get_current_run_tree()
         if run_tree:
@@ -71,7 +73,7 @@ class ThinkerRouter:
         cached = await self._session_store.get_cached_result(domain=domain, query=query)
         if cached is not None:
             log.info("router.cache_hit", domain=domain, session_id=session_id)
-            return cached
+            return ThinkResult(response=cached)
 
         thinker = self._thinkers.get(domain)
 
@@ -80,7 +82,7 @@ class ThinkerRouter:
             # Fallback to knowledge thinker for unknown domains
             thinker = self._thinkers.get("knowledge")
             if thinker is None:
-                return "I wasn't able to find that information right now."
+                return ThinkResult(response="I wasn't able to find that information right now.")
 
         log.info(
             "router.routing",
@@ -89,23 +91,37 @@ class ThinkerRouter:
             query=query[:100],
         )
 
+        # Load user context if we have a user_id
+        user_context = UserContext()
+        if user_id:
+            user_context = await self._session_store.get_user_context(user_id)
+
         try:
-            result = await thinker.think(query=query, context=context)
+            think_result = await thinker.think(query=query, context=context, user_context=user_context)
             log.info(
                 "router.success",
                 session_id=session_id,
                 domain=domain,
-                result_length=len(result),
+                result_length=len(think_result.response),
+                has_context_update=think_result.context_update is not None,
             )
+
+            # Apply context updates and track signals
+            if user_id:
+                user_context.signals.record_topic(domain)
+                if think_result.context_update and not think_result.context_update.is_empty():
+                    user_context = await self._session_store.apply_context_update(user_id, think_result.context_update, source_domain=domain)
+                else:
+                    await self._session_store.save_user_context(user_id, user_context)
 
             # Cache the result for future identical queries
             await self._session_store.cache_thinker_result(
                 domain=domain,
                 query=query,
-                result=result,
+                result=think_result.response,
             )
 
-            return result
+            return think_result
         except Exception as e:
             log.error(
                 "router.thinker_error",
@@ -113,4 +129,4 @@ class ThinkerRouter:
                 domain=domain,
                 error=str(e),
             )
-            return "I ran into an issue looking that up. Could you try asking again?"
+            return ThinkResult(response="I ran into an issue looking that up. Could you try asking again?")

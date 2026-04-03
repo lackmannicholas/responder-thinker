@@ -3,13 +3,14 @@ Knowledge Thinker — generalist fallback for anything that doesn't fit a domain
 
 Uses gpt-4.1 (advanced model) because general Q&A requires broad reasoning.
 No domain-specific tools — relies on the model's parametric knowledge.
-Uses conversation context to ground answers.
+Uses conversation context and user summary to ground answers.
 """
 
 from langsmith import traceable
 
 from backend.config import settings, make_openai_client
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import ThinkResult, UserContext
 
 client = make_openai_client()
 
@@ -29,8 +30,12 @@ class KnowledgeThinker(BaseThinker):
     model = settings.thinker_model_advanced
 
     @traceable(name="knowledge_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
         messages: list[dict] = [{"role": "system", "content": KNOWLEDGE_SYSTEM_PROMPT}]
+
+        # Include conversation summary for richer grounding
+        if user_context.summary.text:
+            messages.append({"role": "system", "content": f"Conversation summary so far: {user_context.summary.text}"})
 
         # Include recent conversation turns to ground the answer in context
         for turn in context[-4:]:
@@ -43,4 +48,4 @@ class KnowledgeThinker(BaseThinker):
             messages=messages,
         )
 
-        return response.choices[0].message.content or "I don't have information on that right now."
+        return ThinkResult(response=response.choices[0].message.content or "I don't have information on that right now.")

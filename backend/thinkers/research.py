@@ -12,6 +12,7 @@ import structlog
 from langsmith import traceable
 
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import ThinkResult, UserContext
 
 log = structlog.get_logger()
 
@@ -25,7 +26,7 @@ class ResearchThinker(BaseThinker):
     model = "mock"
 
     @traceable(name="research_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
         log.info(
             "research_thinker.started",
             query=query[:100],
@@ -37,10 +38,12 @@ class ResearchThinker(BaseThinker):
 
         log.info("research_thinker.complete", query=query[:100])
 
-        return (
-            f"After extensive research, here's what I found about your question: "
-            f'"{query}". This is a simulated result from a long-running task that '
-            f"took about {SIMULATED_DELAY} seconds to complete. In a real system "
-            f"this could be a complex database query, a multi-step API pipeline, "
-            f"or an agentic research workflow."
+        return ThinkResult(
+            response=(
+                f"After extensive research, here's what I found about your question: "
+                f'"{query}". This is a simulated result from a long-running task that '
+                f"took about {SIMULATED_DELAY} seconds to complete. In a real system "
+                f"this could be a complex database query, a multi-step API pipeline, "
+                f"or an agentic research workflow."
+            )
         )

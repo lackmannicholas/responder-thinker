@@ -13,6 +13,7 @@ from langsmith import traceable
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import ThinkResult, UserContext, ContextUpdate
 
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -161,12 +162,33 @@ class StocksThinker(BaseThinker):
     model = settings.thinker_model
 
     @traceable(name="stocks_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
+        effective_query = query
+        prefs = user_context.preferences
+
+        if prefs.watched_tickers:
+            effective_query = f"{query}\n\nContext: The user's watched tickers are " f"{', '.join(prefs.watched_tickers)}."
+
         agent = Agent(
             name="Stocks Specialist",
             instructions=STOCKS_SYSTEM_PROMPT,
             model=self.model,
             tools=[get_stock_quote, search_stock_symbol],
         )
-        result = await Runner.run(agent, query)
-        return result.final_output
+        result = await Runner.run(agent, effective_query)
+        response = result.final_output
+
+        # Extract ticker symbols mentioned in the query to add to watched list
+        import re
+
+        update = ContextUpdate()
+        tickers_in_query = re.findall(r'\b[A-Z]{1,5}\b', query)
+        known_tickers = {t for t in tickers_in_query if t in _MOCK_STOCKS or len(t) >= 2}
+        for ticker in known_tickers:
+            update.add_watched_tickers.append(ticker)
+            update.new_facts.append(f"Asked about {ticker} stock")
+
+        return ThinkResult(
+            response=response,
+            context_update=update if not update.is_empty() else None,
+        )

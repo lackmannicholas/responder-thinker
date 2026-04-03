@@ -16,6 +16,7 @@ from langsmith import traceable
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import ThinkResult, UserContext
 
 _NEWSAPI_BASE = "https://newsapi.org/v2"
 
@@ -188,7 +189,7 @@ class NewsThinker(BaseThinker):
     model = settings.thinker_model_advanced
 
     @traceable(name="news_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(self, query: str, context: list[dict], user_context: UserContext) -> ThinkResult:
         agent = Agent(
             name="News Specialist",
             instructions=NEWS_SYSTEM_PROMPT,
@@ -196,4 +197,4 @@ class NewsThinker(BaseThinker):
             tools=[get_top_headlines, get_headlines_by_category],
         )
         result = await Runner.run(agent, query)
-        return result.final_output
+        return ThinkResult(response=result.final_output)
