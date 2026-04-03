@@ -23,6 +23,11 @@ A production-grade reference implementation of the **multi-thinker Responder-Thi
   - [Triggering Each Thinker](#triggering-each-thinker)
   - [Adding a New Thinker](#adding-a-new-thinker)
 - [Project Structure](#project-structure)
+- [User Context System](#user-context-system)
+  - [Browser Fingerprinting](#browser-fingerprinting)
+  - [Context Model](#context-model)
+  - [Bidirectional Context Flow](#bidirectional-context-flow)
+  - [Conversation Summaries](#conversation-summaries)
 - [How It Works (Deep Dive)](#how-it-works-deep-dive)
   - [WebRTC Signaling](#webrtc-signaling)
   - [Realtime Bridge](#realtime-bridge)
@@ -130,14 +135,22 @@ Multi-thinker is microservices for voice AI:
 │  │ Thinker  │ │ Thinker │ │Thinker │ │  Thinker  │          │
 │  │ gpt-4.1  │ │ gpt-4.1 │ │gpt-4.1 │ │  gpt-4.1  │          │
 │  │  -mini   │ │  -mini  │ │        │ │           │          │
+│  │Open-Meteo│ │ Finnhub │ │NewsAPI │ │ Parametric│          │
 │  └──────────┘ └─────────┘ └────────┘ └───────────┘          │
-│                                                              │
-│  ┌──────────────────┐  ┌──────────────────┐                  │
-│  │  Redis            │  │  LangSmith       │                  │
-│  │  - Conv. history  │  │  - Session trace │                  │
-│  │  - Thinker cache  │  │  - Turn spans    │                  │
-│  │  - Per-domain TTL │  │  - Thinker spans │                  │
-│  └──────────────────┘  └──────────────────┘                  │
+│         │          │          │          │                    │
+│         └──────────┴──────────┴──────────┘                    │
+│                 ContextUpdate (bidirectional)                 │
+│                         │                                    │
+│  ┌──────────────────────▼───────────────────────────────┐    │
+│  │  Redis                                               │    │
+│  │  - Conv. history (session:{id}:conversation, 1h TTL) │    │
+│  │  - Thinker cache (cache:{domain}:{hash}, per-domain) │    │
+│  │  - User context  (user:{fingerprint}:context, no TTL)│    │
+│  └──────────────────────────────────────────────────────-┘    │
+│  ┌──────────────────────────────────────────────────────┐     │
+│  │  LangSmith                                           │     │
+│  │  - Session trace → Turn spans → Thinker spans        │     │
+│  └──────────────────────────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -223,6 +236,10 @@ pip install -e ".[dev]"
 cat > .env << 'EOF'
 OPENAI_API_KEY=sk-your-key-here
 
+# Optional: Real API data (mock data used when unset)
+# FINNHUB_API_KEY=your-finnhub-key     # https://finnhub.io/register (free)
+# NEWSAPI_API_KEY=your-newsapi-key     # https://newsapi.org/register (free)
+
 # Optional: LangSmith tracing
 # LANGSMITH_TRACING_ENABLED=true
 # LANGSMITH_API_KEY=lsv2-your-key-here
@@ -264,13 +281,15 @@ The Docker setup includes:
 
 ### Overview
 
-| Thinker | Domain | Model | Tools | Purpose |
-|---------|--------|-------|-------|---------|
-| **Weather** | `weather` | `gpt-4.1-mini` | `get_current_weather` | Current conditions and forecasts |
-| **Stocks** | `stocks` | `gpt-4.1-mini` | `get_stock_price` | Stock prices and market data |
-| **News** | `news` | `gpt-4.1` | `get_news_headlines` | Recent headlines and current events |
-| **Knowledge** | `knowledge` | `gpt-4.1` | None (parametric) | General Q&A — the fallback for anything |
-| **Research** | `research` | Mock (30s delay) | None | Simulates long-running tasks for stalling tests |
+| Thinker | Domain | Model | Tools | API | Purpose |
+|---------|--------|-------|-------|-----|---------|
+| **Weather** | `weather` | `gpt-4.1-mini` | `get_current_weather` | [Open-Meteo](https://open-meteo.com/) (free) | Current conditions and forecasts |
+| **Stocks** | `stocks` | `gpt-4.1-mini` | `get_stock_price` | [Finnhub](https://finnhub.io/) (free tier) | Stock prices and market data |
+| **News** | `news` | `gpt-4.1` | `get_news_headlines` | [NewsAPI](https://newsapi.org/) (free tier) | Recent headlines and current events |
+| **Knowledge** | `knowledge` | `gpt-4.1` | None (parametric) | — | General Q&A with summary grounding |
+| **Research** | `research` | Mock (30s delay) | None | — | Simulates long-running tasks for stalling tests |
+
+All Thinkers with external APIs include **mock fallbacks** — when an API key is missing or the service is unreachable, they return realistic static data. This means the system works out of the box with just `OPENAI_API_KEY`.
 
 ### Triggering Each Thinker
 
@@ -287,9 +306,10 @@ The Responder routes to `domain: "weather"` → `WeatherThinker` calls `get_curr
 
 **Tool — `get_current_weather`**:
 - **Input**: `location` (e.g., "Seattle, WA"), optional `unit` ("fahrenheit" or "celsius")
-- **Output**: Temperature, conditions, humidity, wind speed
+- **Output**: Temperature, feels-like, conditions, humidity, wind speed/gusts
 - **Cache TTL**: 10 minutes
-- **Note**: Currently returns mock data. Drop in a real weather API (OpenWeatherMap, WeatherAPI) in `backend/thinkers/weather.py`.
+- **API**: [Open-Meteo](https://open-meteo.com/) — free, no API key required. Uses geocoding API for location resolution and WMO weather codes for human-readable conditions. Falls back to mock data if the API is unreachable.
+- **User Context**: Respects `preferences.default_location` and `preferences.temperature_unit`. Writes queried locations back as memory facts.
 
 #### Stocks Thinker
 Ask about stock prices, market data, or specific tickers.
@@ -302,9 +322,10 @@ The Responder routes to `domain: "stocks"` → `StocksThinker` calls `get_stock_
 
 **Tool — `get_stock_price`**:
 - **Input**: `symbol` (e.g., "AAPL", "TSLA", "SPY")
-- **Output**: Current price, daily change, percentage change, volume
+- **Output**: Current price, daily change, percentage change, volume, company name
 - **Cache TTL**: 1 minute
-- **Note**: Currently returns mock data. Integrate Alpha Vantage, Polygon.io, or Yahoo Finance.
+- **API**: [Finnhub](https://finnhub.io/) — free tier (60 req/min). Requires `FINNHUB_API_KEY`. Uses `/quote` for prices, `/stock/profile2` for company info, and `/search` for ticker lookup by name. Falls back to mock data with pre-defined prices for popular tickers (AAPL, TSLA, MSFT, GOOGL, NVDA, SPY) when the API key is missing or the API is unreachable.
+- **User Context**: Extracts ticker symbols from queries and adds them to `preferences.watched_tickers`. Records facts like "Asked about AAPL stock".
 
 #### News Thinker
 Ask about current events, headlines, or news on any topic.
@@ -319,7 +340,7 @@ The Responder routes to `domain: "news"` → `NewsThinker` calls `get_news_headl
 - **Input**: `topic` (e.g., "AI", "economy", "sports"), optional `count` (1-5)
 - **Output**: Headline, source, summary for each story
 - **Cache TTL**: 5 minutes
-- **Note**: Currently returns mock data. Integrate NewsAPI or GNews.
+- **API**: [NewsAPI](https://newsapi.org/) — free tier (100 req/day). Requires `NEWSAPI_API_KEY`. Uses `/everything` for topic searches with a 3-day rolling window, and `/top-headlines` for category queries (business, entertainment, health, science, sports, technology). Falls back to mock data with pre-defined headlines for popular topics when the API key is missing or the API is unreachable.
 
 #### Knowledge Thinker
 Ask general knowledge questions, facts, explanations — anything that doesn't fit a specific domain. This is also the fallback when routing is ambiguous.
@@ -330,7 +351,7 @@ Ask general knowledge questions, facts, explanations — anything that doesn't f
 
 The Responder routes to `domain: "knowledge"` → `KnowledgeThinker` uses `gpt-4.1` parametric knowledge + recent conversation context → returns a conversational answer.
 
-**No external tools** — relies on the model's built-in knowledge grounded by the last 4 conversation turns from Redis.
+**No external tools** — relies on the model's built-in knowledge grounded by the last 4 conversation turns from Redis. When available, the user's rolling conversation summary is injected into the system prompt for cross-session context.
 
 #### Research Thinker
 Triggers a simulated 30-second delay. Use this to test how the Responder handles long-running backend tasks.
@@ -349,6 +370,7 @@ from langsmith import traceable
 from openai import AsyncOpenAI
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
+from backend.state.user_context import UserContext, ThinkResult, ContextUpdate
 
 client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -358,7 +380,10 @@ class YourDomainThinker(BaseThinker):
     model = settings.thinker_model  # or thinker_model_advanced
 
     @traceable(name="your_domain_thinker.think")
-    async def think(self, query: str, context: list[dict]) -> str:
+    async def think(
+        self, query: str, context: list[dict],
+        user_context: UserContext | None = None,
+    ) -> ThinkResult:
         # Your domain logic here — call APIs, use tools, etc.
         response = await client.chat.completions.create(
             model=self.model,
@@ -367,7 +392,10 @@ class YourDomainThinker(BaseThinker):
                 {"role": "user", "content": query},
             ],
         )
-        return response.choices[0].message.content
+        return ThinkResult(
+            response=response.choices[0].message.content,
+            context_update=ContextUpdate(new_facts=["User asked about your domain"]),
+        )
 ```
 
 2. **Register it** — in `backend/thinkers/router.py`, import and add to `_register_thinkers()`:
@@ -409,21 +437,22 @@ And add a description for the Responder:
 responder-thinker/
 ├── backend/
 │   ├── main.py                      # FastAPI app — endpoints, lifespan, session mgmt
-│   ├── config.py                    # Pydantic settings from environment / .env
+│   ├── config.py                    # Pydantic settings, make_openai_client()
 │   ├── audio_convert.py             # PCM16 resampling (48kHz↔24kHz) via libswresample
 │   ├── transport/
 │   │   ├── realtime_bridge.py       # Core orchestration — bridges WebRTC ↔ Realtime API
 │   │   └── webrtc_server.py         # aiortc peer connections, AudioOutputStream
 │   ├── thinkers/
-│   │   ├── base.py                  # BaseThinker ABC: async think(query, context) → str
-│   │   ├── router.py                # ThinkerRouter — domain lookup, caching, fallback
-│   │   ├── weather.py               # Weather domain — get_current_weather tool
-│   │   ├── stocks.py                # Stocks domain — get_stock_price tool
-│   │   ├── news.py                  # News domain — get_news_headlines tool
-│   │   ├── knowledge.py             # Knowledge domain — parametric fallback
+│   │   ├── base.py                  # BaseThinker ABC: think(query, context, user_context) → ThinkResult
+│   │   ├── router.py                # ThinkerRouter — domain lookup, caching, context updates
+│   │   ├── weather.py               # Weather domain — Open-Meteo API + mock fallback
+│   │   ├── stocks.py                # Stocks domain — Finnhub API + mock fallback
+│   │   ├── news.py                  # News domain — NewsAPI + mock fallback
+│   │   ├── knowledge.py             # Knowledge domain — parametric + summary grounding
 │   │   └── research.py              # Research domain — 30s delay for stalling tests
 │   ├── state/
-│   │   └── session_store.py         # Redis session state, conversation history, caching
+│   │   ├── session_store.py         # Redis session state, conversation history, caching
+│   │   └── user_context.py          # Pydantic models — UserContext, Preferences, ContextUpdate
 │   └── observability/
 │       └── tracing.py               # LangSmith setup
 ├── frontend/
@@ -436,6 +465,72 @@ responder-thinker/
 ├── pyproject.toml                   # Dependencies and project metadata
 └── test_*.py                        # Integration tests (WebRTC echo, Realtime API, pipeline)
 ```
+
+---
+
+## User Context System
+
+The system maintains persistent, cross-session memory for each user — keyed by a browser fingerprint so it "recognizes" returning users without requiring login.
+
+### Browser Fingerprinting
+
+When the browser connects, it generates a SHA-256 hash from:
+- Canvas rendering fingerprint
+- WebGL renderer string
+- Platform, timezone, screen resolution
+- Language and hardware concurrency
+
+This fingerprint is sent with the SDP offer and used as the `user_id` key for all context lookups. No cookies, no accounts — the system recognizes the same browser silently.
+
+### Context Model
+
+All persistent user state lives in a single `UserContext` object stored in Redis with **no TTL**:
+
+```
+UserContext
+├── Preferences              (overwrite semantics)
+│   ├── name                 # Extracted from "My name is Nick" patterns
+│   ├── default_location     # Set by weather queries ("Seattle")
+│   ├── temperature_unit     # "fahrenheit" or "celsius"
+│   └── watched_tickers      # Accumulated from stock queries
+├── MemoryStore              (append semantics, capped at 20 facts)
+│   └── facts[]              # Inferred observations: "User asked about AAPL stock"
+├── Summary                  (rolling merge)
+│   ├── text                 # 3-5 sentence summary of all conversations
+│   ├── turn_count_at_summary
+│   └── updated_at
+└── Signals                  (analytics)
+    ├── topic_counts         # {"weather": 5, "stocks": 3, ...}
+    ├── last_active
+    └── session_count        # "This is session #4 with this user"
+```
+
+### Bidirectional Context Flow
+
+Context flows in both directions — into Thinkers and back out:
+
+**Into Thinkers** (read path):
+- Every Thinker receives the full `UserContext` alongside the query
+- Weather Thinker uses `default_location` and `temperature_unit`
+- Stocks Thinker checks `watched_tickers` for patterns
+- Knowledge Thinker uses `summary.text` for cross-session grounding
+
+**Out of Thinkers** (write path):
+- Thinkers return a `ThinkResult` containing a `response` and an optional `ContextUpdate`
+- `ContextUpdate` supports: `set_name`, `set_default_location`, `set_temperature_unit`, `add_watched_tickers`, `new_facts`
+- The `ThinkerRouter` applies updates to Redis immediately
+- After any context update, the Responder's system prompt is refreshed mid-session via `session.update`
+
+**Name extraction**: The bridge also watches user transcripts for introduction patterns ("My name is Nick", "I'm Nick", "Call me Nick") and writes the name directly to `preferences.name`.
+
+### Conversation Summaries
+
+A rolling summary is generated to carry context across sessions:
+
+- **On disconnect**: When the Realtime API WebSocket closes, the bridge generates a summary using `gpt-4.1-mini` from the last 30 conversation turns
+- **Mid-session**: Every 10 turns, the summary is regenerated to keep it current
+- **Merge, not overwrite**: The summarization prompt explicitly instructs the model to *integrate* new information with the existing summary, preserving prior context
+- **Cross-session grounding**: The Knowledge Thinker injects the summary into its system prompt, so the model naturally references prior conversations
 
 ---
 
@@ -458,11 +553,15 @@ Once ICE negotiation completes, audio flows bidirectionally over WebRTC. The bro
 `RealtimeBridge` is the core of the system. For each session, it:
 
 1. Opens a WebSocket to OpenAI's Realtime API (`wss://us.api.openai.com/v1/realtime`)
-2. Configures the session: voice, audio format (24kHz PCM16), semantic VAD, tools, and system instructions
-3. Runs three concurrent async loops:
+2. Loads persistent user context from Redis (via browser fingerprint) and enriches the system prompt
+3. Configures the session: voice, audio format (24kHz PCM16), semantic VAD, tools, and personalized instructions
+4. Runs four concurrent async loops:
    - **Audio input loop**: Reads WebRTC frames → resamples → forwards to Realtime API
    - **Event handler loop**: Reads Realtime API events → dispatches audio/tool calls/transcripts
    - **Idle monitor loop**: Tracks user activity → nudges at 15s → disconnects at 60s
+   - **Audio drain monitor loop**: Detects when audio finishes playing → resets idle timer
+
+When the Realtime API WebSocket closes (browser disconnect), the bridge generates a final conversation summary before tearing down.
 
 ### Tool Call Interception
 
@@ -523,13 +622,13 @@ The bridge monitors user activity:
 
 Thinkers are stateless by design — all shared state lives in Redis:
 
-**Conversation History**
+**Conversation History** (session-scoped, ephemeral)
 - Key: `session:{id}:conversation`
 - Each turn stored as `{role, content, timestamp}`
 - Thinkers receive the last 10 turns for context grounding
 - TTL: 1 hour
 
-**Thinker Result Cache**
+**Thinker Result Cache** (shared across sessions)
 - Key: `cache:{domain}:{query_hash}`
 - Shared across all sessions — if two users ask the same question, the second gets a cache hit
 - Per-domain TTLs:
@@ -542,6 +641,12 @@ Thinkers are stateless by design — all shared state lives in Redis:
 | Default | 2 minutes |
 
 The `ThinkerRouter` checks the cache before calling any Thinker. Cache hits are logged and traced.
+
+**User Context** (permanent, cross-session)
+- Key: `user:{fingerprint}:context`
+- Stores preferences, memory facts, conversation summary, and behavioral signals
+- **No TTL** — persists forever so the system truly "remembers" returning users
+- See [User Context System](#user-context-system) for full details
 
 ### Observability (LangSmith)
 
@@ -581,12 +686,15 @@ All configuration is via environment variables (or `.env` file):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | *required* | OpenAI API key |
+| `OPENAI_BASE_URL` | `https://us.api.openai.com/v1` | OpenAI API base URL (regional endpoint support) |
 | `REALTIME_MODEL` | `gpt-realtime` | Model for the Responder (Realtime API) |
 | `REALTIME_VOICE` | `shimmer` | Voice for audio output |
 | `TRANSCRIPT_MODEL` | `gpt-4o-mini-transcribe` | Model for input audio transcription |
 | `THINKER_MODEL` | `gpt-4.1-mini` | Model for fast Thinkers (Weather, Stocks) |
 | `THINKER_MODEL_ADVANCED` | `gpt-4.1` | Model for complex Thinkers (News, Knowledge) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
+| `FINNHUB_API_KEY` | *(empty)* | [Finnhub](https://finnhub.io/register) API key for live stock data. Mock data used if unset. |
+| `NEWSAPI_API_KEY` | *(empty)* | [NewsAPI](https://newsapi.org/register) API key for live news. Mock data used if unset. |
 | `LANGSMITH_TRACING_ENABLED` | `false` | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | *(empty)* | LangSmith API key |
 | `LANGSMITH_PROJECT` | `responder-thinker` | LangSmith project name |
@@ -615,7 +723,15 @@ Server VAD triggers on raw silence thresholds, which produces false positives du
 
 ### Why Redis for state?
 
-Thinkers are stateless by design — they receive a query and context and return a response. Shared state (conversation history, cached results) lives outside them in Redis. This means multiple Thinkers can read the same context, results cache globally across sessions, and the architecture scales horizontally across backend instances.
+Thinkers are stateless by design — they receive a query and context and return a response. Shared state (conversation history, cached results, user context) lives outside them in Redis. This means multiple Thinkers can read the same context, results cache globally across sessions, user preferences persist across sessions with no TTL, and the architecture scales horizontally across backend instances.
+
+### Why browser fingerprinting instead of accounts?
+
+This is a demo/reference architecture, not a production auth system. Browser fingerprinting gives us persistent user identity with zero friction — no login, no cookies, no middleware. The same fingerprint maps to the same `UserContext` across sessions. In production, you'd swap the fingerprint for a real user ID from your auth system — the `user_id` parameter flows through the entire stack already.
+
+### Why mock fallbacks on real APIs?
+
+Every external API Thinker (weather, stocks, news) works without API keys. When keys are missing or the service is unreachable, Thinkers return realistic mock data. This means the system is functional out of the box with just `OPENAI_API_KEY`, which lowers the barrier to trying it. It also means Thinkers are independently testable without external dependencies.
 
 ---
 
