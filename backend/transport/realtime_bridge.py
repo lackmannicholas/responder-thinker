@@ -92,8 +92,8 @@ backend agents (Thinkers) handle complex questions.
 - Greet users warmly and maintain natural conversation
 - When the user asks something that needs real data (weather, stocks, news, \
   or complex knowledge), call the `route_to_thinker` tool with the right domain
-- While waiting for the Thinker, keep talking naturally. Acknowledge what they \
-  asked. Say "let me look that up" or "one moment while I check." Don't go silent.
+- When calling the Thinker, ALWAYS give an acknowledgement. Keep it to 2-5 words. Be natural. \
+  Don't go silent. Examples "Yeah, one sec." or "Let me check that." 
 - When the Thinker result arrives, deliver it conversationally — don't read it \
   like a report. Weave it into the conversation.
 
@@ -144,10 +144,17 @@ class RealtimeBridge:
         # be shared across concurrent sessions.
         self._audio_converter = AudioConverter()
 
-        # Per-session VAD gate — None when VAD is disabled
-        self._vad_gate: VADGate | None = (
-            VADGate(settings.vad) if settings.vad.enabled else None
-        )
+        # Per-session VAD gate — None when VAD is disabled or unsupported platform
+        self._vad_gate: VADGate | None = None
+        if settings.vad.enabled:
+            try:
+                self._vad_gate = VADGate(settings.vad)
+            except NotImplementedError as e:
+                log.warning(
+                    "bridge.vad_unavailable",
+                    reason=str(e),
+                    session_id=session_id,
+                )
 
         # Coordination: monotonic turn counter to detect stale thinker results
         self._turn_id: int = 0
@@ -298,7 +305,9 @@ class RealtimeBridge:
                         "transcription": {
                             "model": "gpt-4o-mini-transcribe",
                         },
-                        "turn_detection": {"type": "semantic_vad"},  # {"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 500},
+                        # Local VAD drives commits → disable server-side turn detection.
+                        # When VAD is disabled or unavailable, fall back to semantic_vad.
+                        "turn_detection": ({"type": "none"} if self._vad_gate is not None else {"type": "semantic_vad"}),
                     },
                     "output": {
                         "format": {
@@ -413,7 +422,7 @@ class RealtimeBridge:
                 "details — merge them together.\n\n"
                 "Focus on: key topics discussed, user preferences revealed, facts learned about the user, "
                 "and any unresolved questions. Write in third person (e.g. 'The user asked about...'). "
-                "Keep the combined summary to 3-5 sentences."
+                "Keep the total summary under 1000 tokens."
             )
             if previous:
                 system += f"\n\nExisting summary to integrate with (DO NOT discard this):\n{previous}"
@@ -506,6 +515,26 @@ class RealtimeBridge:
                 log.info("bridge.name_extracted", session_id=self.session_id, name=name)
                 return
 
+    async def _commit_and_respond(self):
+        """
+        Called by _audio_input_loop when local VAD detects speech end.
+
+        Commits the accumulated input buffer (telling OpenAI the turn is
+        complete) then requests a response. Uses the same serialization
+        guards as the thinker path so concurrent callers don't race on
+        response.create.
+        """
+        if not self._realtime_ws:
+            return
+        try:
+            await self._realtime_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            async with self._response_create_lock:
+                await self._response_done.wait()
+                if self._running:
+                    await self._realtime_ws.send(json.dumps({"type": "response.create"}))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
     async def _audio_input_loop(self):
         """
         Read audio frames from the browser (WebRTC track) and forward
@@ -540,14 +569,31 @@ class RealtimeBridge:
                     if self._vad_gate is not None:
                         result = self._vad_gate.process(pcm16_bytes)
                         chunks_to_send = result.frames_to_flush
+
+                        # Speech onset: reset idle timer; interrupt if model is mid-response
+                        if result.speech_started:
+                            self._reset_idle_timer()
+                            if self._response_active:
+                                self.event_queue.put_nowait({"type": "transcript_interrupted"})
+                                await self._end_turn("[interrupted by user]")
+                                await self._handle_interrupt()
+
+                        # Speech end: commit the buffer and request a response
+                        if result.speech_ended:
+                            self._reset_idle_timer()
+                            asyncio.create_task(self._commit_and_respond())
                     else:
                         chunks_to_send = [pcm16_bytes]
 
                     for chunk in chunks_to_send:
-                        await self._realtime_ws.send(json.dumps({
-                            "type": "input_audio_buffer.append",
-                            "audio": pcm16_bytes_to_b64(chunk),
-                        }))
+                        await self._realtime_ws.send(
+                            json.dumps(
+                                {
+                                    "type": "input_audio_buffer.append",
+                                    "audio": pcm16_bytes_to_b64(chunk),
+                                }
+                            )
+                        )
                 except (av.error.InvalidDataError, ValueError, IndexError, TypeError) as e:
                     # Transient audio frame errors — log and continue, don't kill the session
                     log.warning("bridge.audio_frame_error", error=str(e), session_id=self.session_id)
@@ -753,6 +799,7 @@ class RealtimeBridge:
                                             "Gently check in — ask if they're still there "
                                             "or if there's anything else you can help with. "
                                             "Do NOT repeat or summarize anything from a tool call. "
+                                            "NEVER repeat the previous response or read back information the user has already heard. "
                                             "If a tool is running, it's best to acknowledge that and say you'll get back to them when you have the information. "
                                             "Keep it brief and warm — just a short check-in. "
                                             "Example No Tool Running: \"Hi? Are you still there? Is there anything else I can help with?\" "

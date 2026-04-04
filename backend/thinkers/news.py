@@ -8,6 +8,7 @@ more reasoning than simple data lookups.
 """
 
 import json
+import structlog
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -17,6 +18,8 @@ from langsmith import traceable
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 from backend.state.user_context import ThinkResult, UserContext
+
+log = structlog.get_logger()
 
 _NEWSAPI_BASE = "https://newsapi.org/v2"
 
@@ -38,6 +41,7 @@ _MOCK_HEADLINES: dict[str, list[dict]] = {
 }
 
 
+@traceable(name="news_thinker.think._mock_headlines")
 def _mock_headlines(topic: str, count: int = 3) -> str:
     normalized = topic.lower().strip()
     headlines = _MOCK_HEADLINES.get(
@@ -56,6 +60,7 @@ def _mock_headlines(topic: str, count: int = 3) -> str:
     )
 
 
+@traceable(name="news_thinker.think._mock_category")
 def _mock_category(category: str, count: int = 3) -> str:
     return json.dumps(
         {
@@ -67,16 +72,11 @@ def _mock_category(category: str, count: int = 3) -> str:
     )
 
 
-@function_tool
-async def get_top_headlines(topic: str, count: int = 3) -> str:
-    """Get recent top headlines for a topic or keyword.
-
-    Args:
-        topic: The topic or search query, e.g. 'AI', 'economy', 'sports'
-        count: Number of headlines to return (1-10)
-    """
+@traceable(name="news_thinker.think.get_top_headlines")
+async def _get_top_headlines(topic: str, count: int = 3) -> str:
     api_key = settings.newsapi_api_key
     if not api_key:
+        log.info("news_thinker.think._get_top_headlines: No News API Key")
         return _mock_headlines(topic, count)
 
     count = max(1, min(count, 10))
@@ -115,20 +115,26 @@ async def get_top_headlines(topic: str, count: int = 3) -> str:
 
             return json.dumps({"topic": topic, "headlines": headlines})
     except Exception:
+        log.exception("news_thinker.think._get_top_headlines error")
         return _mock_headlines(topic, count)
 
 
 @function_tool
-async def get_headlines_by_category(category: str, country: str = "us", count: int = 3) -> str:
-    """Get top headlines by news category.
+async def get_top_headlines(topic: str, count: int = 3) -> str:
+    """Get recent top headlines for a topic or keyword.
 
     Args:
-        category: One of: business, entertainment, general, health, science, sports, technology
-        country: ISO 3166-1 alpha-2 country code, e.g. 'us', 'gb', 'de'
+        topic: The topic or search query, e.g. 'AI', 'economy', 'sports'
         count: Number of headlines to return (1-10)
     """
+    return await _get_top_headlines(topic, count)
+
+
+@traceable(name="news_thinker.think.get_headlines_by_category")
+async def _get_headlines_by_category(category: str, country: str = "us", count: int = 3) -> str:
     api_key = settings.newsapi_api_key
     if not api_key:
+        log.info("news_thinker.think._get_headlines_by_category: No News API Key")
         return _mock_category(category, count)
 
     count = max(1, min(count, 10))
@@ -166,7 +172,20 @@ async def get_headlines_by_category(category: str, country: str = "us", count: i
 
             return json.dumps({"category": category, "country": country, "headlines": headlines})
     except Exception:
+        log.exception("news_thinker.think._get_headlines_by_category error")
         return _mock_category(category, count)
+
+
+@function_tool
+async def get_headlines_by_category(category: str, country: str = "us", count: int = 3) -> str:
+    """Get top headlines by news category.
+
+    Args:
+        category: One of: business, entertainment, general, health, science, sports, technology
+        country: ISO 3166-1 alpha-2 country code, e.g. 'us', 'gb', 'de'
+        count: Number of headlines to return (1-10)
+    """
+    return await _get_headlines_by_category(category, country, count)
 
 
 NEWS_SYSTEM_PROMPT = """\

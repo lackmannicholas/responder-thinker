@@ -32,6 +32,8 @@ class VADResult:
     is_speech: bool
     speech_probability: float
     frames_to_flush: list[bytes]
+    speech_started: bool = False  # True on SILENCE → SPEECH transition (onset)
+    speech_ended: bool = False    # True on HANGOVER → SILENCE transition (offset)
 
 
 class _State(Enum):
@@ -100,6 +102,8 @@ class VADGate:
         # 3. Apply state machine using the latest probability
         is_speech_frame = prob >= self._config.threshold
         frames_to_flush: list[bytes] = []
+        speech_started = False
+        speech_ended = False
 
         if self._state == _State.SILENCE:
             if is_speech_frame:
@@ -107,6 +111,7 @@ class VADGate:
                 frames_to_flush = list(self._pre_roll) + [pcm16_bytes]
                 self._pre_roll.clear()
                 self._state = _State.SPEECH
+                speech_started = True
             else:
                 self._pre_roll.append(pcm16_bytes)
 
@@ -129,11 +134,14 @@ class VADGate:
                 # countdown == 0: speech end declared
                 self._state = _State.SILENCE
                 self._pre_roll.append(pcm16_bytes)
+                speech_ended = True
 
         return VADResult(
             is_speech=self._state in (_State.SPEECH, _State.HANGOVER),
             speech_probability=prob,
             frames_to_flush=frames_to_flush,
+            speech_started=speech_started,
+            speech_ended=speech_ended,
         )
 
     def reset(self) -> None:

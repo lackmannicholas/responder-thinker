@@ -8,12 +8,15 @@ Requires FINNHUB_API_KEY env var (free tier: 60 req/min, https://finnhub.io/regi
 import json
 
 import httpx
+import structlog
 from agents import Agent, Runner, function_tool
 from langsmith import traceable
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 from backend.state.user_context import ThinkResult, UserContext, ContextUpdate
+
+log = structlog.get_logger()
 
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -28,6 +31,7 @@ _MOCK_STOCKS = {
 }
 
 
+@traceable(name="stocks_thinker.think._mock_quote")
 def _mock_quote(symbol: str) -> str:
     symbol = symbol.upper().strip()
     m = _MOCK_STOCKS.get(symbol, {"name": symbol, "price": 100.00, "change": 0.50, "pct": 0.50})
@@ -44,15 +48,11 @@ def _mock_quote(symbol: str) -> str:
     )
 
 
-@function_tool
-async def get_stock_quote(symbol: str) -> str:
-    """Get the current price, daily change, and volume for a stock ticker.
-
-    Args:
-        symbol: Stock ticker symbol, e.g. 'AAPL', 'TSLA', 'MSFT'
-    """
+@traceable(name="stocks_thinker.think.get_stock_quote")
+async def _get_stock_quote(symbol: str) -> str:
     token = settings.finnhub_api_key
     if not token:
+        log.info("stocks_thinker.think.get_stock_quote: No Finnhub API key")
         return _mock_quote(symbol)
 
     symbol = symbol.upper().strip()
@@ -92,7 +92,18 @@ async def get_stock_quote(symbol: str) -> str:
                 }
             )
     except Exception:
+        log.exception("stocks_thinker.think.get_stock_quote error")
         return _mock_quote(symbol)
+
+
+@function_tool
+async def get_stock_quote(symbol: str) -> str:
+    """Get the current price, daily change, and volume for a stock ticker.
+
+    Args:
+        symbol: Stock ticker symbol, e.g. 'AAPL', 'TSLA', 'MSFT'
+    """
+    return await _get_stock_quote(symbol)
 
 
 def _mock_search(query: str) -> str:
@@ -107,15 +118,11 @@ def _mock_search(query: str) -> str:
     )
 
 
-@function_tool
-async def search_stock_symbol(query: str) -> str:
-    """Search for a stock ticker symbol by company name.
-
-    Args:
-        query: Company name or partial name, e.g. 'Apple', 'Tesla'
-    """
+@traceable(name="stocks_thinker.think.search_stock_symbol")
+async def _search_stock_symbol(query: str) -> str:
     token = settings.finnhub_api_key
     if not token:
+        log.info("stocks_thinker.think.search_stock_symbol: No Finnhub API key")
         return _mock_search(query)
 
     try:
@@ -139,7 +146,18 @@ async def search_stock_symbol(query: str) -> str:
 
             return json.dumps({"query": query, "results": results})
     except Exception:
+        log.exception("stocks_thinker.think.search_stock_symbol error")
         return _mock_search(query)
+
+
+@function_tool
+async def search_stock_symbol(query: str) -> str:
+    """Search for a stock ticker symbol by company name.
+
+    Args:
+        query: Company name or partial name, e.g. 'Apple', 'Tesla'
+    """
+    return await _search_stock_symbol(query)
 
 
 STOCKS_SYSTEM_PROMPT = """\

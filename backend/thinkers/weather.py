@@ -8,12 +8,15 @@ Uses the OpenAI Agents SDK with a local function tool that calls the Open-Meteo 
 import json
 
 import httpx
+import structlog
 from agents import Agent, Runner, function_tool
 from langsmith import traceable
 
 from backend.config import settings
 from backend.thinkers.base import BaseThinker
 from backend.state.user_context import ThinkResult, UserContext, ContextUpdate
+
+log = structlog.get_logger()
 
 # WMO Weather interpretation codes → human-readable descriptions
 # https://open-meteo.com/en/docs
@@ -49,6 +52,7 @@ _WMO_CODES: dict[int, str] = {
 }
 
 
+@traceable(name="weather_thinker.think._mock_weather")
 def _mock_weather(location: str, unit: str = "fahrenheit") -> str:
     return json.dumps(
         {
@@ -65,14 +69,8 @@ def _mock_weather(location: str, unit: str = "fahrenheit") -> str:
     )
 
 
-@function_tool
-async def get_current_weather(location: str, unit: str = "fahrenheit") -> str:
-    """Get current weather conditions for a location.
-
-    Args:
-        location: City and optional state/country, e.g. 'Seattle, WA' or 'London, UK'
-        unit: Temperature unit — 'fahrenheit' or 'celsius'
-    """
+@traceable(name="weather_thinker.think.get_current_weather")
+async def _get_current_weather(location: str, unit: str = "fahrenheit") -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             # Geocode location → lat/lon
@@ -122,7 +120,19 @@ async def get_current_weather(location: str, unit: str = "fahrenheit") -> str:
                 }
             )
     except Exception:
+        log.exception("weather_thinker.think.get_current_weather error")
         return _mock_weather(location, unit)
+
+
+@function_tool
+async def get_current_weather(location: str, unit: str = "fahrenheit") -> str:
+    """Get current weather conditions for a location.
+
+    Args:
+        location: City and optional state/country, e.g. 'Seattle, WA' or 'London, UK'
+        unit: Temperature unit — 'fahrenheit' or 'celsius'
+    """
+    return await _get_current_weather(location, unit)
 
 
 WEATHER_SYSTEM_PROMPT = """\
