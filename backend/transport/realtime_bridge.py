@@ -110,6 +110,14 @@ backend agents (Thinkers) handle complex questions.
 - If you're unsure which domain, use "knowledge" as the default.
 - If the Thinker takes a while, it's okay to fill time with small talk or \
   related context you already know.
+
+## Idle check-ins:
+Sometimes the system will ask you to check in with a quiet user. When this happens:
+- Say ONLY a short generic check-in (under 10 words). Examples: "Hey, you still there?" \
+  or "Anything else I can help with?"
+- NEVER repeat, summarize, or reference any previous information, tool results, or topics.
+- Do NOT recap what you just told the user.
+- This is just a presence check, not a conversation continuation.
 """
 
 
@@ -149,6 +157,7 @@ class RealtimeBridge:
         if settings.vad.enabled:
             try:
                 self._vad_gate = VADGate(settings.vad)
+                log.info("bridge.vad_enabled", session_id=session_id, vad_settings=settings.vad.model_dump())
             except NotImplementedError as e:
                 log.warning(
                     "bridge.vad_unavailable",
@@ -173,6 +182,9 @@ class RealtimeBridge:
         self._last_activity: float = time.monotonic()
         self._last_user_speech: float = time.monotonic()
         self._nudge_sent: bool = False
+
+        # Track in-flight thinker tasks so idle nudges can adjust messaging
+        self._active_thinker_count: int = 0
         self._audio_drained: asyncio.Event = asyncio.Event()
 
         # Event queue for pushing transcripts/events to the frontend via SSE
@@ -288,6 +300,9 @@ class RealtimeBridge:
                 has_preferences=self._user_context.preferences.default_location is not None,
                 memory_facts=len(self._user_context.memory.facts),
             )
+
+        if self._vad_gate is not None:
+            log.info("bridge.local_vad_enabled", session_id=self.session_id, vad_settings=settings.vad.model_dump())
 
         config = {
             "type": "session.update",
@@ -573,6 +588,7 @@ class RealtimeBridge:
                         # Speech onset: reset idle timer; interrupt if model is mid-response
                         if result.speech_started:
                             self._reset_idle_timer()
+                            log.info("bridge.local_vad.speech_started", session_id=self.session_id)
                             if self._response_active:
                                 self.event_queue.put_nowait({"type": "transcript_interrupted"})
                                 await self._end_turn("[interrupted by user]")
@@ -581,6 +597,7 @@ class RealtimeBridge:
                         # Speech end: commit the buffer and request a response
                         if result.speech_ended:
                             self._reset_idle_timer()
+                            log.info("bridge.local_vad.speech_ended", session_id=self.session_id)
                             asyncio.create_task(self._commit_and_respond())
                     else:
                         chunks_to_send = [pcm16_bytes]
@@ -786,7 +803,30 @@ class RealtimeBridge:
                         idle_seconds=round(idle, 1),
                     )
                     self.event_queue.put_nowait({"type": "session_idle_nudge"})
-                    # Ask the Responder to gently check in with the user
+                    # Ask the Responder to gently check in with the user.
+                    # Build instructions based on whether a thinker is in-flight.
+                    thinker_running = self._active_thinker_count > 0
+                    if thinker_running:
+                        nudge_instructions = (
+                            "A backend tool is still working. Say a SHORT filler "
+                            "acknowledging you're still gathering info. Under 10 words. "
+                            "Example: \"Still working on that for you.\" "
+                            "Do NOT say what you are looking up. Do NOT mention any topic. "
+                            "Do NOT repeat any previous response content."
+                        )
+                    else:
+                        nudge_instructions = (
+                            "The user has been quiet. Produce ONLY a brief, generic "
+                            "check-in — under 10 words, no substance. "
+                            "Example: \"Hey, you still there?\" "
+                            "Example: \"Anything else I can help with?\" \n\n"
+                            "STRICT RULES — violating any of these is an error:\n"
+                            "- Do NOT mention, repeat, summarize, or reference ANY previous topic, "
+                            "tool result, or information from this conversation.\n"
+                            "- Do NOT say what you found, looked up, or talked about.\n"
+                            "- Do NOT continue the previous response in any way.\n"
+                            "- ONLY produce a short, generic check-in."
+                        )
                     async with self._response_create_lock:
                         await self._response_done.wait()
                         await self._realtime_ws.send(
@@ -794,17 +834,7 @@ class RealtimeBridge:
                                 {
                                     "type": "response.create",
                                     "response": {
-                                        "instructions": (
-                                            "The user has been quiet for a moment. "
-                                            "Gently check in — ask if they're still there "
-                                            "or if there's anything else you can help with. "
-                                            "Do NOT repeat or summarize anything from a tool call. "
-                                            "NEVER repeat the previous response or read back information the user has already heard. "
-                                            "If a tool is running, it's best to acknowledge that and say you'll get back to them when you have the information. "
-                                            "Keep it brief and warm — just a short check-in. "
-                                            "Example No Tool Running: \"Hi? Are you still there? Is there anything else I can help with?\" "
-                                            "Example Tool Running: \"Is there anything else I can help with while I gather that information?\" "
-                                        ),
+                                        "instructions": nudge_instructions,
                                     },
                                 }
                             )
@@ -931,6 +961,7 @@ class RealtimeBridge:
 
         # Snapshot the turn so we can detect staleness after the thinker returns
         dispatched_turn_id = self._turn_id
+        self._active_thinker_count += 1
 
         log.info(
             "bridge.thinker_routed",
@@ -973,6 +1004,7 @@ class RealtimeBridge:
         )
 
         self.event_queue.put_nowait({"type": "thinker", "event": "complete", "domain": domain, "elapsed_ms": round(elapsed_ms, 1)})
+        self._active_thinker_count = max(0, self._active_thinker_count - 1)
 
         # If the thinker returned context updates, refresh the Responder's
         # system prompt so it immediately knows what the thinkers learned.
