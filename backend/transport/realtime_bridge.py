@@ -281,7 +281,7 @@ class RealtimeBridge:
                 )
         finally:
             await self._end_session_trace()
-            self.event_queue.put_nowait(None)  # Signal SSE stream to close
+            await self.cleanup()
 
     async def _configure_session(self):
         """Send initial session configuration to the Realtime API."""
@@ -623,9 +623,7 @@ class RealtimeBridge:
         finally:
             # Browser disconnected — close the Realtime API WebSocket so
             # the event handler loop exits and run() can reach its finally block.
-            self._running = False
-            if self._realtime_ws:
-                await self._realtime_ws.close()
+            await self.cleanup()
 
     async def _event_handler_loop(self):
         """
@@ -720,11 +718,21 @@ class RealtimeBridge:
         playback pace is controlled by AudioOutputStream.recv(). This loop
         watches for the transition from real audio → silence, which is when
         the user is truly "idle."
+
+        Uses a timeout on the wait so the loop re-checks _running
+        periodically — without this, a bare .wait() hangs forever
+        and prevents asyncio.gather (and therefore the whole session)
+        from ever completing.
         """
         try:
             while self._running:
-                await self._audio_drained.wait()
+                try:
+                    await asyncio.wait_for(self._audio_drained.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
                 self._audio_drained.clear()
+                if not self._running:
+                    break
                 # Only reset the nudge timer, NOT _nudge_sent or the disconnect timer.
                 # The user hasn't spoken — the agent just finished talking.
                 self._last_activity = time.monotonic()
@@ -1095,9 +1103,16 @@ class RealtimeBridge:
             await self._realtime_ws.send(json.dumps({"type": "response.create"}))
 
     async def cleanup(self):
-        """Clean up resources."""
+        """Force-stop the bridge and clean up resources. Idempotent — safe to call multiple times."""
         self._running = False
-        self.event_queue.put_nowait(None)  # Signal SSE to close
+        self._audio_drained.set()  # Wake up drain monitor so it exits immediately
         if self._realtime_ws:
-            await self._realtime_ws.close()
+            try:
+                await self._realtime_ws.close()
+            except Exception:
+                pass
+        try:
+            self.event_queue.put_nowait(None)  # Signal SSE to close
+        except Exception:
+            pass
         log.info("bridge.cleaned_up", session_id=self.session_id)

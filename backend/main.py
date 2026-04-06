@@ -94,6 +94,10 @@ async def rtc_offer(request: dict):
     )
     _bridges[session_id] = bridge
 
+    # When WebRTC peer disconnects, force-stop the bridge so the
+    # Realtime API WebSocket doesn't hang open.
+    session_tracks.on_close = bridge.cleanup
+
     async def _run_and_cleanup():
         try:
             await bridge.run()
@@ -104,6 +108,21 @@ async def rtc_offer(request: dict):
     asyncio.create_task(_run_and_cleanup())
 
     return {"sdp": answer_sdp, "session_id": session_id}
+
+
+@app.post("/api/rtc/disconnect")
+async def rtc_disconnect(request: dict):
+    """
+    Explicit disconnect signal from the frontend.
+    Ensures the Realtime API WebSocket and bridge are torn down even if
+    the WebRTC state-change event is delayed or lost.
+    """
+    sid = request.get("session_id")
+    bridge = _bridges.get(sid)
+    if bridge:
+        log.info("rtc.explicit_disconnect", session_id=sid)
+        await bridge.cleanup()
+    return {"ok": True}
 
 
 @app.websocket("/ws/{session_id}")

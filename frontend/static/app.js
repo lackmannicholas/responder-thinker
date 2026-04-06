@@ -258,6 +258,17 @@ function disconnect() {
 }
 
 function cleanup() {
+    // Notify the backend to tear down the Realtime API WS immediately.
+    // sendBeacon is fire-and-forget and works even during page unload.
+    if (sessionId) {
+        try {
+            navigator.sendBeacon(
+                '/api/rtc/disconnect',
+                new Blob([JSON.stringify({ session_id: sessionId })], { type: 'application/json' })
+            );
+        } catch (_) { }
+    }
+
     if (eventSource) {
         eventSource.close();
         eventSource = null;
@@ -280,6 +291,16 @@ function cleanup() {
     document.getElementById('connectBtn').disabled = false;
     document.getElementById('disconnectBtn').disabled = true;
 }
+
+// Ensure the backend tears down the session if the user closes/navigates away
+window.addEventListener('beforeunload', () => {
+    if (sessionId) {
+        navigator.sendBeacon(
+            '/api/rtc/disconnect',
+            new Blob([JSON.stringify({ session_id: sessionId })], { type: 'application/json' })
+        );
+    }
+});
 
 // --- Server-Sent Events (transcripts & thinker events) ---
 

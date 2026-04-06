@@ -231,6 +231,7 @@ class SessionTracks:
     peer_connection: RTCPeerConnection
     input_track: MediaStreamTrack | None = None  # Audio FROM browser
     output_track: AudioOutputStream = field(default_factory=AudioOutputStream)  # Audio TO browser
+    on_close: object = None  # async callback fired when the peer connection closes
 
 
 class WebRTCServer:
@@ -269,6 +270,12 @@ class WebRTCServer:
                 state=pc.connectionState,
             )
             if pc.connectionState in ("failed", "closed"):
+                # Signal the bridge to tear down the Realtime API WS
+                if session.on_close:
+                    try:
+                        await session.on_close()
+                    except Exception:
+                        pass
                 await self.close_session(session_id)
 
         # Add our output track (audio TO browser) to the peer connection
