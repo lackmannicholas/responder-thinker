@@ -316,10 +316,12 @@ class RealtimeBridge:
                             "type": "audio/pcm",
                             "rate": 24000,
                         },
-                        # "noise_reduction": {"type": "far_field"},
                         "transcription": {
-                            "model": "gpt-4o-mini-transcribe",
+                            "model": settings.transcript_model,
                         },
+                        # openai vad is turned off when using local VAD, but noise reduction still helps model performance
+                        # and understanding, so keep it on regardless.
+                        "noise_reduction": {"type": "near_field"},
                         # Local VAD drives commits → disable server-side turn detection.
                         # When VAD is disabled or unavailable, fall back to semantic_vad.
                         **({} if self._vad_gate is not None else {"turn_detection": {"type": "semantic_vad"}}),
@@ -443,7 +445,7 @@ class RealtimeBridge:
                 system += f"\n\nExisting summary to integrate with (DO NOT discard this):\n{previous}"
 
             resp = await client.chat.completions.create(
-                model=settings.thinker_model,  # gpt-4.1-mini — cheap & fast
+                model=settings.thinker_model,  # gpt-5.4-mini — cheap & fast
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": f"New conversation to integrate:\n{transcript}"},

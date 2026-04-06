@@ -33,6 +33,7 @@ A production-grade reference implementation of the **multi-thinker Responder-Thi
   - [Realtime Bridge](#realtime-bridge)
   - [Tool Call Interception](#tool-call-interception)
   - [Stalling & Conversation Flow](#stalling--conversation-flow)
+  - [Local VAD (Voice Activity Detection)](#local-vad-voice-activity-detection)
   - [Barge-In / Interruption Handling](#barge-in--interruption-handling)
   - [Idle Detection](#idle-detection)
   - [State Management (Redis)](#state-management-redis)
@@ -91,7 +92,7 @@ A single-thinker architecture is a monolith: one agent responsible for data look
 
 Multi-thinker is microservices for voice AI:
 - Each Thinker has a concise, domain-specific prompt that doesn't compete with other domains
-- Simple lookups use `gpt-4.1-mini` (~100ms); complex reasoning uses `gpt-4.1`
+- Simple lookups use `gpt-5.4-mini` (~100ms); complex reasoning uses `gpt-5.4`
 - Per-domain caching: weather caches for 10 minutes, stocks for 1 minute
 - Swap or add domains without touching existing Thinkers
 
@@ -133,7 +134,7 @@ Multi-thinker is microservices for voice AI:
 │  ┌──────────┐ ┌─────────┐ ┌────────┐ ┌───────────┐          │
 │  │ Weather  │ │ Stocks  │ │  News  │ │ Knowledge │          │
 │  │ Thinker  │ │ Thinker │ │Thinker │ │  Thinker  │          │
-│  │ gpt-4.1  │ │ gpt-4.1 │ │gpt-4.1 │ │  gpt-4.1  │          │
+│  │ gpt-5.4  │ │ gpt-5.4 │ │gpt-5.4 │ │  gpt-5.4  │          │
 │  │  -mini   │ │  -mini  │ │        │ │           │          │
 │  │Open-Meteo│ │ Finnhub │ │NewsAPI │ │ Parametric│          │
 │  └──────────┘ └─────────┘ └────────┘ └───────────┘          │
@@ -283,10 +284,10 @@ The Docker setup includes:
 
 | Thinker | Domain | Model | Tools | API | Purpose |
 |---------|--------|-------|-------|-----|---------|
-| **Weather** | `weather` | `gpt-4.1-mini` | `get_current_weather` | [Open-Meteo](https://open-meteo.com/) (free) | Current conditions and forecasts |
-| **Stocks** | `stocks` | `gpt-4.1-mini` | `get_stock_price` | [Finnhub](https://finnhub.io/) (free tier) | Stock prices and market data |
-| **News** | `news` | `gpt-4.1` | `get_news_headlines` | [NewsAPI](https://newsapi.org/) (free tier) | Recent headlines and current events |
-| **Knowledge** | `knowledge` | `gpt-4.1` | None (parametric) | — | General Q&A with summary grounding |
+| **Weather** | `weather` | `gpt-5.4-mini` | `get_current_weather` | [Open-Meteo](https://open-meteo.com/) (free) | Current conditions and forecasts |
+| **Stocks** | `stocks` | `gpt-5.4-mini` | `get_stock_price` | [Finnhub](https://finnhub.io/) (free tier) | Stock prices and market data |
+| **News** | `news` | `gpt-5.4` | `get_news_headlines` | [NewsAPI](https://newsapi.org/) (free tier) | Recent headlines and current events |
+| **Knowledge** | `knowledge` | `gpt-5.4` | None (parametric) | — | General Q&A with summary grounding |
 | **Research** | `research` | Mock (30s delay) | None | — | Simulates long-running tasks for stalling tests |
 
 All Thinkers with external APIs include **mock fallbacks** — when an API key is missing or the service is unreachable, they return realistic static data. This means the system works out of the box with just `OPENAI_API_KEY`.
@@ -349,7 +350,7 @@ Ask general knowledge questions, facts, explanations — anything that doesn't f
 > *"Explain how photosynthesis works."*
 > *"Who won the 1969 World Series?"*
 
-The Responder routes to `domain: "knowledge"` → `KnowledgeThinker` uses `gpt-4.1` parametric knowledge + recent conversation context → returns a conversational answer.
+The Responder routes to `domain: "knowledge"` → `KnowledgeThinker` uses `gpt-5.4` parametric knowledge + recent conversation context → returns a conversational answer.
 
 **No external tools** — relies on the model's built-in knowledge grounded by the last 4 conversation turns from Redis. When available, the user's rolling conversation summary is injected into the system prompt for cross-session context.
 
@@ -439,6 +440,7 @@ responder-thinker/
 │   ├── main.py                      # FastAPI app — endpoints, lifespan, session mgmt
 │   ├── config.py                    # Pydantic settings, make_openai_client()
 │   ├── audio_convert.py             # PCM16 resampling (48kHz↔24kHz) via libswresample
+│   ├── vad.py                       # Local VAD gate — TEN VAD speech detection with pre-roll/hangover
 │   ├── transport/
 │   │   ├── realtime_bridge.py       # Core orchestration — bridges WebRTC ↔ Realtime API
 │   │   └── webrtc_server.py         # aiortc peer connections, AudioOutputStream
@@ -527,7 +529,7 @@ Context flows in both directions — into Thinkers and back out:
 
 A rolling summary is generated to carry context across sessions:
 
-- **On disconnect**: When the Realtime API WebSocket closes, the bridge generates a summary using `gpt-4.1-mini` from the last 30 conversation turns
+- **On disconnect**: When the Realtime API WebSocket closes, the bridge generates a summary using `gpt-5.4-mini` from the last 30 conversation turns
 - **Mid-session**: Every 10 turns, the summary is regenerated to keep it current
 - **Merge, not overwrite**: The summarization prompt explicitly instructs the model to *integrate* new information with the existing summary, preserving prior context
 - **Cross-session grounding**: The Knowledge Thinker injects the summary into its system prompt, so the model naturally references prior conversations
@@ -554,9 +556,9 @@ Once ICE negotiation completes, audio flows bidirectionally over WebRTC. The bro
 
 1. Opens a WebSocket to OpenAI's Realtime API (`wss://us.api.openai.com/v1/realtime`)
 2. Loads persistent user context from Redis (via browser fingerprint) and enriches the system prompt
-3. Configures the session: voice, audio format (24kHz PCM16), semantic VAD, tools, and personalized instructions
+3. Configures the session: voice, audio format (24kHz PCM16), local VAD (with semantic VAD fallback), tools, and personalized instructions
 4. Runs four concurrent async loops:
-   - **Audio input loop**: Reads WebRTC frames → resamples → forwards to Realtime API
+   - **Audio input loop**: Reads WebRTC frames → resamples → VAD gate → forwards to Realtime API
    - **Event handler loop**: Reads Realtime API events → dispatches audio/tool calls/transcripts
    - **Idle monitor loop**: Tracks user activity → nudges at 15s → disconnects at 60s
    - **Audio drain monitor loop**: Detects when audio finishes playing → resets idle timer
@@ -601,11 +603,49 @@ The Responder's system prompt is engineered for natural stalling. When it calls 
 
 The Research Thinker (30-second delay) exists specifically to stress-test this behavior.
 
+### Local VAD (Voice Activity Detection)
+
+The backend runs a local Voice Activity Detection (VAD) gate to suppress silence before forwarding audio to OpenAI. This reduces bandwidth, lowers Realtime API costs (you're not paying to stream silence), and gives the backend precise control over turn boundaries.
+
+**How it works:**
+
+```
+WebRTC audio (24kHz PCM16)
+    │
+    ▼ VADGate.process(chunk)
+    │  - Downsample 24kHz → 16kHz for TEN VAD inference
+    │  - Run speech probability through state machine
+    │
+    ├─ SILENCE state: buffer chunk in pre-roll ring buffer, send nothing
+    ├─ SPEECH onset: flush pre-roll + current chunk → Realtime API
+    ├─ SPEECH state: forward chunks immediately → Realtime API
+    └─ HANGOVER → SILENCE: speech ended → commit buffer + request response
+```
+
+**State machine:**
+
+| State | On speech frame | On silence frame |
+|-------|----------------|------------------|
+| SILENCE | → SPEECH (flush pre-roll) | Stay (buffer in pre-roll) |
+| SPEECH | Stay (forward audio) | → HANGOVER (start countdown) |
+| HANGOVER | → SPEECH (forward audio) | Decrement counter; if 0 → SILENCE |
+
+**Key features:**
+- **Pre-roll buffer**: Captures the ~100ms of audio *before* speech onset so the first syllable isn't clipped
+- **Hangover**: Keeps forwarding audio for a configurable number of frames after speech drops below the threshold, preventing mid-word cutoffs on brief pauses
+- **Post-roll**: Continues streaming for a configurable duration after speech ends for natural trailing audio
+- **Barge-in integration**: Speech onset triggers interruption if the Responder is mid-response or audio is still draining
+- **Turn management**: Speech end triggers `input_audio_buffer.commit` + `response.create`, giving the backend explicit control over when turns are submitted
+
+**Fallback**: When local VAD is disabled (`VAD__ENABLED=false`) or `ten_vad` is unavailable on the platform, the bridge falls back to OpenAI's built-in `semantic_vad` for server-side turn detection. The system works either way — local VAD just gives you more control and lower costs.
+
+One `VADGate` is created per `RealtimeBridge` (per session). It uses [TEN VAD](https://github.com/AgoraIO-Extensions/ten_vad) for inference, running on CPU with no GPU required.
+
 ### Barge-In / Interruption Handling
 
-When the user starts speaking while the Responder is outputting audio:
+When the user starts speaking while the Responder is outputting audio (detected by local VAD speech onset, or `input_audio_buffer.speech_started` from the API when local VAD is disabled):
 
-1. `input_audio_buffer.speech_started` event fires
+1. Local VAD detects speech onset (or server sends `speech_started` event)
 2. Bridge cancels the in-flight response (`response.cancel`)
 3. Bridge increments `turn_id` — invalidating any in-flight thinker tasks
 4. Bridge flushes the audio output queue (so the speaker stops immediately)
@@ -687,17 +727,24 @@ All configuration is via environment variables (or `.env` file):
 |----------|---------|-------------|
 | `OPENAI_API_KEY` | *required* | OpenAI API key |
 | `OPENAI_BASE_URL` | `https://us.api.openai.com/v1` | OpenAI API base URL (regional endpoint support) |
-| `REALTIME_MODEL` | `gpt-realtime` | Model for the Responder (Realtime API) |
+| `REALTIME_MODEL` | `gpt-realtime-1.5` | Model for the Responder (Realtime API) |
 | `REALTIME_VOICE` | `shimmer` | Voice for audio output |
-| `TRANSCRIPT_MODEL` | `gpt-4o-mini-transcribe` | Model for input audio transcription |
-| `THINKER_MODEL` | `gpt-4.1-mini` | Model for fast Thinkers (Weather, Stocks) |
-| `THINKER_MODEL_ADVANCED` | `gpt-4.1` | Model for complex Thinkers (News, Knowledge) |
+| `TRANSCRIPT_MODEL` | `gpt-4o-mini-transcribe` | Model for input audio transcription (Realtime API built-in) |
+| `THINKER_MODEL` | `gpt-5.4-mini` | Model for fast Thinkers (Weather, Stocks) |
+| `THINKER_MODEL_ADVANCED` | `gpt-5.4` | Model for complex Thinkers (News, Knowledge) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 | `FINNHUB_API_KEY` | *(empty)* | [Finnhub](https://finnhub.io/register) API key for live stock data. Mock data used if unset. |
 | `NEWSAPI_API_KEY` | *(empty)* | [NewsAPI](https://newsapi.org/register) API key for live news. Mock data used if unset. |
 | `LANGSMITH_TRACING_ENABLED` | `false` | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | *(empty)* | LangSmith API key |
 | `LANGSMITH_PROJECT` | `responder-thinker` | LangSmith project name |
+| `VAD__ENABLED` | `true` | Enable local VAD gate (suppresses silence, manages turn boundaries) |
+| `VAD__THRESHOLD` | `0.7` | Speech probability threshold (0.0–1.0) |
+| `VAD__VAD_SAMPLE_RATE` | `16000` | Sample rate for VAD inference (TEN VAD expects 16kHz) |
+| `VAD__VAD_FRAME_MS` | `32` | Frame duration in ms for VAD inference |
+| `VAD__PRE_ROLL_MS` | `100` | Audio to retain before speech onset (prevents first-syllable clipping) |
+| `VAD__POST_ROLL_MS` | `300` | Audio to continue after speech ends |
+| `VAD__HANGOVER_FRAMES` | `15` | Silence frames before SPEECH → SILENCE transition |
 | `RTC_FORCE_HOST` | *(unset)* | Docker only: IP to advertise in ICE candidates |
 | `RTC_PORT_RANGE` | *(unset)* | Docker only: UDP port range for WebRTC (e.g., `10000-10100`) |
 
@@ -717,9 +764,11 @@ A single generalist thinker becomes a god-object: one prompt responsible for wea
 
 The dumbest model makes the most important decision — and that's the right architecture. Routing needs to be fast (~100ms). The Responder already has full conversational context. "What kind of question is this?" is a dramatically simpler task than "what's the answer?" Constraining routing to a fixed enum of domains makes misclassification rare and fallback trivial (unknown → Knowledge Thinker).
 
-### Why semantic VAD instead of server VAD?
+### Why local VAD instead of relying on server VAD?
 
-Server VAD triggers on raw silence thresholds, which produces false positives during natural pauses. Semantic VAD understands conversational turn-taking — it knows the difference between "thinking about what to say next" and "done talking." This reduces unnecessary interruptions and produces more natural conversation flow.
+The backend runs a local VAD gate ([TEN VAD](https://github.com/AgoraIO-Extensions/ten_vad)) that filters audio *before* it reaches OpenAI. This has three advantages: (1) **Cost** — you're not streaming silence to the API, which reduces audio token usage. (2) **Control** — the backend decides exactly when to commit the audio buffer and request a response, rather than relying on OpenAI's turn detection heuristics. (3) **Barge-in precision** — speech onset is detected locally with sub-frame latency, so interruptions are faster than waiting for a server-side round trip.
+
+When local VAD is unavailable or disabled, the system falls back to OpenAI's `semantic_vad`, which understands conversational turn-taking and knows the difference between "thinking about what to say next" and "done talking." Both paths work — local VAD is the preferred default for production deployments.
 
 ### Why Redis for state?
 

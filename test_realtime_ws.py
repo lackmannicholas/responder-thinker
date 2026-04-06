@@ -21,7 +21,7 @@ import os
 import websockets
 
 REALTIME_API_URL = "wss://api.openai.com/v1/realtime"
-MODEL = os.environ.get("REALTIME_MODEL", "gpt-4o-realtime-preview")
+MODEL = os.environ.get("REALTIME_MODEL", "gpt-realtime-1.5")
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 

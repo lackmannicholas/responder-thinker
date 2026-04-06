@@ -15,7 +15,7 @@ load_dotenv()
 
 class VADConfig(BaseModel):
     enabled: bool = True
-    threshold: float = 0.7
+    threshold: float = 0.8
     vad_sample_rate: int = 16000
     vad_frame_ms: int = 32
     pre_roll_ms: int = 100
@@ -32,16 +32,16 @@ class Settings(BaseSettings):
 
     # Realtime API (the Responder)
     # Use a versioned model name — the undated alias is sometimes rejected.
-    # Valid options: gpt-4o-realtime-preview-2024-12-17, gpt-4o-mini-realtime-preview-2024-12-17
-    realtime_model: str = "gpt-realtime"
+    # Valid options: gpt-realtime-1.5, gpt-4o-realtime-preview-2024-12-17
+    realtime_model: str = "gpt-realtime-1.5"
     realtime_voice: str = "shimmer"
 
     # transcript model
     transcript_model: str = "gpt-4o-mini-transcribe"
 
     # Thinker models
-    thinker_model: str = "gpt-4.1-mini"  # Weather, Stocks (fast)
-    thinker_model_advanced: str = "gpt-4.1"  # News, Knowledge (smarter)
+    thinker_model: str = "gpt-5.4-mini"  # Weather, Stocks (fast)
+    thinker_model_advanced: str = "gpt-5.4"  # News, Knowledge (smarter)
 
     # Redis
     redis_url: str = "redis://localhost:6379"
