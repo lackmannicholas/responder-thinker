@@ -15,7 +15,7 @@ load_dotenv()
 
 class VADConfig(BaseModel):
     enabled: bool = True
-    threshold: float = 0.8
+    threshold: float = 0.7
     vad_sample_rate: int = 16000
     vad_frame_ms: int = 32
     pre_roll_ms: int = 100
