@@ -137,6 +137,11 @@ class AudioOutputStream(MediaStreamTrack):
         frame.sample_rate = self._SAMPLE_RATE
         return frame
 
+    @property
+    def has_queued_audio(self) -> bool:
+        """True if there are frames waiting to be played."""
+        return not self._queue.empty() or len(self._buffer) > 0
+
     def clear(self):
         """Flush all queued audio (used on user interruption / barge-in)."""
         while not self._queue.empty():

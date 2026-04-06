@@ -585,11 +585,14 @@ class RealtimeBridge:
                         result = self._vad_gate.process(pcm16_bytes)
                         chunks_to_send = result.frames_to_flush
 
-                        # Speech onset: reset idle timer; interrupt if model is mid-response
+                        # Speech onset: reset idle timer; interrupt if audio is playing
                         if result.speech_started:
                             self._reset_idle_timer()
                             log.info("bridge.local_vad.speech_started", session_id=self.session_id)
-                            if self._response_active:
+                            # Interrupt if the model is mid-response OR audio is
+                            # still draining from a completed response.
+                            has_queued_audio = self.audio_track and self.audio_track.output_track.has_queued_audio
+                            if self._response_active or has_queued_audio:
                                 self.event_queue.put_nowait({"type": "transcript_interrupted"})
                                 await self._end_turn("[interrupted by user]")
                                 await self._handle_interrupt()
