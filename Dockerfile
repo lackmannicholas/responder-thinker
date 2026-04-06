@@ -1,7 +1,9 @@
-FROM python:3.14-slim
+FROM --platform=linux/amd64 python:3.14-slim
 
-# Patch OS-level vulnerabilities in the base image
-RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
+# Patch OS-level vulnerabilities in the base image; install libc++ for ten_vad native lib
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+  && apt-get install -y --no-install-recommends libc++1 \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 

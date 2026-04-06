@@ -322,7 +322,7 @@ class RealtimeBridge:
                         },
                         # Local VAD drives commits → disable server-side turn detection.
                         # When VAD is disabled or unavailable, fall back to semantic_vad.
-                        "turn_detection": ({"type": "none"} if self._vad_gate is not None else {"type": "semantic_vad"}),
+                        **({} if self._vad_gate is not None else {"turn_detection": {"type": "semantic_vad"}}),
                     },
                     "output": {
                         "format": {

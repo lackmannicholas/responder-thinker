@@ -13,18 +13,22 @@ from fractions import Fraction
 
 import av
 import numpy as np
-import ten_vad
+
+try:
+    import ten_vad
+except (ImportError, OSError):
+    ten_vad = None  # type: ignore[assignment]
 
 
 @dataclass
 class VADConfig:
     enabled: bool = True
-    threshold: float = 0.5
+    threshold: float = 0.6
     vad_sample_rate: int = 16000
     vad_frame_ms: int = 32
     pre_roll_ms: int = 100
     post_roll_ms: int = 300
-    hangover_frames: int = 8
+    hangover_frames: int = 15
 
 
 @dataclass
@@ -33,7 +37,7 @@ class VADResult:
     speech_probability: float
     frames_to_flush: list[bytes]
     speech_started: bool = False  # True on SILENCE → SPEECH transition (onset)
-    speech_ended: bool = False    # True on HANGOVER → SILENCE transition (offset)
+    speech_ended: bool = False  # True on HANGOVER → SILENCE transition (offset)
 
 
 class _State(Enum):
@@ -47,14 +51,20 @@ _INPUT_SAMPLE_RATE = 24000  # PCM16 input rate (from AudioConverter)
 
 class VADGate:
     def __init__(self, config: VADConfig) -> None:
+        if ten_vad is None:
+            raise NotImplementedError("ten_vad is not available on this platform")
         self._config = config
         self._hop_size = int(config.vad_sample_rate * config.vad_frame_ms / 1000)
-        self._vad_model = ten_vad.TenVad(hop_size=self._hop_size)
+        try:
+            self._vad_model = ten_vad.TenVad(hop_size=self._hop_size)
+        except Exception as exc:
+            # ten_vad's __del__ crashes on a partially-constructed TenVad;
+            # silence it so the fallback path isn't spammed with tracebacks.
+            ten_vad.TenVad.__del__ = lambda self: None
+            raise NotImplementedError(str(exc)) from exc
 
         # 24kHz → 16kHz resampler, for VAD inference only
-        self._resampler = av.AudioResampler(
-            format="s16", layout="mono", rate=config.vad_sample_rate
-        )
+        self._resampler = av.AudioResampler(format="s16", layout="mono", rate=config.vad_sample_rate)
 
         # Pre-roll ring buffer: holds 24kHz PCM16 byte chunks
         max_pre_roll = math.ceil(config.pre_roll_ms / 20)
