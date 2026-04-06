@@ -789,6 +789,22 @@ class RealtimeBridge:
                                     pass
                         except websockets.exceptions.ConnectionClosed:
                             pass
+
+                    # Wait for the goodbye audio to finish playing through
+                    # WebRTC before tearing down the connection. Without this,
+                    # the user never hears the goodbye message because the
+                    # connections close while audio is still queued.
+                    if self.audio_track:
+                        try:
+                            # Wait for the pacer to finish draining queued frames.
+                            # _was_playing is True while audio is being sent to
+                            # the browser; poll until it goes False or timeout.
+                            deadline = time.monotonic() + 10.0
+                            while self.audio_track.output_track._was_playing and time.monotonic() < deadline:
+                                await asyncio.sleep(0.1)
+                        except Exception:
+                            pass
+
                     self.event_queue.put_nowait({"type": "session_idle_disconnect"})
                     self._running = False
                     if self._realtime_ws:
